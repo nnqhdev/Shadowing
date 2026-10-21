@@ -1,0 +1,18 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated Video & Audio Outputs
+outputs/
+
+# Temporary / Test files
+test_*.png
+*.tmp
+*.log
+.env
