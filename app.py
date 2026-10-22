@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from generator import DEFAULT_GEMINI_KEY, build_video_job, safe_err
+from studio.storage import ACTIVE_STATUSES, prune_outputs, storage_summary
 from screenwriter import discover_hot_topics_mode_b, generate_5step_screenplay
 
 logger = logging.getLogger(__name__)
@@ -404,6 +405,29 @@ async def delete_job(job_id: str) -> Dict[str, str]:
     if target.exists() and target.parent == OUTPUT_DIR.resolve():
         shutil.rmtree(target, ignore_errors=True)
     return {"status": "deleted"}
+
+
+class CleanupRequest(BaseModel):
+    keep: int = 10
+    dry_run: bool = False
+
+
+@app.get("/api/storage")
+async def api_storage() -> Dict[str, Any]:
+    return await asyncio.to_thread(storage_summary, OUTPUT_DIR)
+
+
+@app.post("/api/storage/cleanup")
+async def api_storage_cleanup(req: CleanupRequest) -> Dict[str, Any]:
+    """Delete all but the newest `keep` job folders; jobs still queued/running are never touched."""
+    active = {jid for jid, j in JOBS.items() if j.get("status") in ACTIVE_STATUSES}
+    result = await asyncio.to_thread(
+        prune_outputs, OUTPUT_DIR, max(0, req.keep), active, req.dry_run
+    )
+    if not req.dry_run:
+        for name in result["removed"]:
+            JOBS.pop(name, None)
+    return result
 
 
 @app.post("/api/open-folder/{job_id}")

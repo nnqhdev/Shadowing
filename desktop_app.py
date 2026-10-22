@@ -288,6 +288,13 @@ class UniPodcastDesktopApp(tk.Tk):
             bg=self.c_card,
         ).pack(side="right")
 
+        self._make_btn(
+            hdr_btns,
+            "🧹 Dọn dẹp",
+            self._cleanup_outputs,
+            bg=self.c_card,
+        ).pack(side="right", padx=(0, 8))
+
         self.lbl_sys_stats = tk.Label(
             hdr_btns,
             text="CPU: --%  |  RAM: --%  |  GPU: --%",
@@ -1282,6 +1289,26 @@ class UniPodcastDesktopApp(tk.Tk):
             self._refresh_jobs_once()
         except Exception as e:
             messagebox.showerror("Lỗi xoá", str(e))
+
+    def _cleanup_outputs(self, keep: int = 10):
+        try:
+            preview = api_request("/api/storage/cleanup", method="POST", payload={"keep": keep, "dry_run": True})
+            if not preview or not preview.get("removed"):
+                messagebox.showinfo("Dọn dẹp", f"Không có gì để dọn (đang có ≤ {keep} video).")
+                return
+            if not messagebox.askyesno(
+                "Dọn dẹp",
+                f"Xoá {len(preview['removed'])} video cũ, giải phóng ~{preview['freed_mb']} MB?\n"
+                f"(Giữ lại {keep} video mới nhất)",
+            ):
+                return
+            done = api_request("/api/storage/cleanup", method="POST", payload={"keep": keep, "dry_run": False})
+            self.selected_job_id = None
+            self._refresh_jobs_once()
+            messagebox.showinfo("Dọn dẹp", f"Đã xoá {len(done['removed'])} video, giải phóng ~{done['freed_mb']} MB.")
+        except Exception as e:
+            logger.exception("Cleanup failed")
+            messagebox.showerror("Lỗi dọn dẹp", str(e))
 
     def _open_web_app_window(self):
         # Ensure backend is alive before opening web window

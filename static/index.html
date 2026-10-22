@@ -581,6 +581,7 @@
   </div>
 
   <button class="btn" onclick="openFolder('')">📂 Mở thư mục chứa tất cả Video</button>
+  <button class="btn" onclick="cleanupOutputs()" title="Giữ lại 10 video mới nhất, xoá các video cũ hơn">🧹 Dọn dẹp</button>
 </header>
 
 <main class="workspace">
@@ -1341,6 +1342,21 @@ function copyText(id) {
   if (!el) return;
   navigator.clipboard.writeText(el.value);
   showToast('📋 Đã copy Mô tả YouTube + Chapters!');
+}
+
+async function cleanupOutputs() {
+  const keep = 10;
+  const post = (dry_run) => fetch('/api/storage/cleanup', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({keep, dry_run})
+  }).then(r => r.json());
+  const preview = await post(true);
+  if (!preview.removed.length) { showToast('✨ Không có gì để dọn (đang có ≤ ' + keep + ' video)'); return; }
+  if (!confirm(`Xoá ${preview.removed.length} video cũ, giải phóng ~${preview.freed_mb} MB?\n(Giữ lại ${keep} video mới nhất)`)) return;
+  const done = await post(false);
+  showToast(`🧹 Đã xoá ${done.removed.length} video, giải phóng ~${done.freed_mb} MB`);
+  refreshJobs();
 }
 
 async function deleteJob(jobId) {
