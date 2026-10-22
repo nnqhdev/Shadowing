@@ -16,3 +16,7 @@ test_*.png
 *.tmp
 *.log
 .env
+
+# macOS
+.DS_Store
+.pytest_cache/
