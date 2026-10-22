@@ -472,9 +472,14 @@ def _collect_system_stats() -> Dict[str, Any]:
             ]
             if utils:
                 gpu_pct = float(max(utils))
+            # ioreg reports a negative counter as an unsigned 64-bit wrap-around (~1.8e19); drop those
             mem_matches = [
-                int(m.group(1))
-                for m in re.finditer(r'"inUse(?:Sys|Vid)MemoryBytes"\s*=\s*(\d+)', out)
+                v
+                for v in (
+                    int(m.group(1))
+                    for m in re.finditer(r'"inUse(?:Sys|Vid)MemoryBytes"\s*=\s*(\d+)', out)
+                )
+                if v < (1 << 48)
             ]
             if mem_matches:
                 gpu_mem_mb = round(max(mem_matches) / (1024 ** 2), 0)
