@@ -3535,8 +3535,8 @@ def format_mmss(seconds: float) -> str:
 
 
 def format_srt_time(seconds: float) -> str:
-    ms = int(round((seconds % 1) * 1000))
-    total = int(seconds)
+    total_ms = int(round(max(0.0, seconds) * 1000))
+    total, ms = divmod(total_ms, 1000)
     m, s = divmod(total, 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
