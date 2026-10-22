@@ -1155,7 +1155,6 @@ class UniPodcastDesktopApp(tk.Tk):
     def _render_selected_detail(self, job: dict):
         lvl = job.get("level", "B1")
         topic = job.get("topic", "")
-        st = job.get("status", "queued")
         prog = job.get("progress", 0)
         msg = job.get("message", "")
 
