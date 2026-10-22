@@ -34,21 +34,25 @@ class BatchItem(BaseModel):
     level: str = "B1"
     category: str = "TIẾNG ANH THỰC TẾ"
     podcast_mode: str = "dialogue"
+    pair_type: str = "male_female"
     custom_script: str = ""
     sensitivity_mode: str = "normal"
+    fast_test: bool = False
 
 
 class BatchRequest(BaseModel):
     items: List[BatchItem]
     podcast_mode: str = "dialogue"
+    pair_type: str = "male_female"
     subtitle_style: str = "teleprompter"
     sensitivity_mode: str = "normal"
     voice: str = "gemini:Aoede"
     voice_male: str = "gemini:Puck"
-    rate: str = "-12%"
-    target_sentences: int = 16
+    rate: str = "+0%"
+    target_sentences: int = 10
     channel_tag: str = "UNI PODCAST"
     gemini_api_key: str = DEFAULT_GEMINI_KEY
+    fast_test: bool = False
 
 
 class ModeBDiscoverRequest(BaseModel):
@@ -65,14 +69,17 @@ class ModeABCreateRequest(BaseModel):
     topic: str
     description: str = ""
     level: str = "B1"
-    target_sentences: int = 16
+    target_sentences: int = 10
+    podcast_mode: str = "dialogue"
+    pair_type: str = "male_female"
     cta: str = "Đăng ký kênh, ôn từ vựng & trả lời câu hỏi dưới bình luận"
     sensitivity_mode: str = "normal"
     voice: str = "gemini:Aoede"
     voice_male: str = "gemini:Puck"
-    rate: str = "-12%"
+    rate: str = "+0%"
     channel_tag: str = "UNI PODCAST"
     gemini_api_key: str = DEFAULT_GEMINI_KEY
+    fast_test: bool = False
 
 
 
@@ -100,12 +107,14 @@ async def worker_run_jobs(job_ids: List[str], req: BatchRequest) -> None:
                     JOBS[current_jid]["progress"] = pct
 
             try:
+                is_fast_test = bool(job.get("fast_test", req.fast_test))
                 res = await build_video_job(
                     job_dir=job_dir,
                     topic=job["topic"],
                     level=job["level"],
                     category=job["category"],
                     podcast_mode=job.get("podcast_mode", req.podcast_mode),
+                    pair_type=job.get("pair_type", req.pair_type),
                     voice=req.voice,
                     voice_male=req.voice_male,
                     rate=req.rate,
@@ -115,11 +124,16 @@ async def worker_run_jobs(job_ids: List[str], req: BatchRequest) -> None:
                     custom_script=job.get("custom_script", ""),
                     subtitle_style=req.subtitle_style,
                     sensitivity_mode=job.get("sensitivity_mode", req.sensitivity_mode),
+                    fast_test=is_fast_test,
                     on_progress=on_prog,
                 )
                 job["status"] = "done"
                 job["progress"] = 100
-                job["message"] = "Hoàn tất xuất video Ngang (16:9) & Dọc (9:16)!"
+                job["message"] = (
+                    "Hoàn tất bản Test Nhanh (480p • 1 phần)!"
+                    if is_fast_test
+                    else "Hoàn tất xuất video Ngang (16:9) & Dọc (9:16)!"
+                )
                 job["result"] = res
                 job["description_text"] = (job_dir / "youtube_description.txt").read_text(
                     encoding="utf-8"
@@ -132,21 +146,40 @@ async def worker_run_jobs(job_ids: List[str], req: BatchRequest) -> None:
 @app.post("/api/batch")
 async def create_batch(req: BatchRequest) -> Dict[str, Any]:
     created_ids: List[str] = []
+    now_ts = time.time()
     for item in req.items:
         if not item.topic.strip():
             continue
+        item_slug = slugify(item.topic)
+        item_lvl = item.level.strip().upper() or "B1"
+        dup_id = next(
+            (
+                j["id"]
+                for j in JOBS.values()
+                if j.get("status") in ("queued", "running")
+                and slugify(j.get("topic", "")) == item_slug
+                and j.get("level", "").upper() == item_lvl
+                and (now_ts - float(j.get("sort_ts", 0))) < 5.0
+            ),
+            None,
+        )
+        if dup_id:
+            continue
         ts = time.strftime("%H%M%S")
         mode_val = item.podcast_mode or req.podcast_mode
+        pair_val = item.pair_type or req.pair_type or "male_female"
         sens_val = item.sensitivity_mode or req.sensitivity_mode or "normal"
-        jid = f"{ts}_{item.level.upper()}_{slugify(item.topic)}_{uuid.uuid4().hex[:4]}"
+        jid = f"{ts}_{item.level.upper()}_{item_slug}_{uuid.uuid4().hex[:4]}"
         JOBS[jid] = {
             "id": jid,
             "topic": item.topic.strip(),
             "level": item.level.strip().upper(),
             "category": item.category.strip().upper(),
             "podcast_mode": mode_val,
+            "pair_type": pair_val,
             "sensitivity_mode": sens_val,
             "custom_script": item.custom_script,
+            "fast_test": bool(item.fast_test or req.fast_test),
             "status": "queued",
             "progress": 0,
             "message": "Đang chờ trong hàng đợi...",
@@ -177,25 +210,56 @@ async def api_mode_b_discover(req: ModeBDiscoverRequest) -> Dict[str, Any]:
 @app.post("/api/mode-ab/create")
 async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
     raw_title = (req.topic or "CHỦ ĐỀ HOT").strip().upper()
-    ts = time.strftime("%H%M%S")
+    title_slug = slugify(raw_title)
     lvl = req.level.strip().upper() or "B1"
-    jid = f"{ts}_{lvl}_{slugify(raw_title)}_{uuid.uuid4().hex[:4]}"
+    now_ts = time.time()
+    existing_jid = next(
+        (
+            j["id"]
+            for j in JOBS.values()
+            if j.get("status") in ("queued", "running")
+            and slugify(j.get("topic", "")) == title_slug
+            and j.get("level", "").upper() == lvl
+            and (now_ts - float(j.get("sort_ts", 0))) < 5.0
+        ),
+        None,
+    )
+    if existing_jid:
+        return {"created_id": existing_jid, "deduplicated": True}
+
+    ts = time.strftime("%H%M%S")
+    jid = f"{ts}_{lvl}_{title_slug}_{uuid.uuid4().hex[:4]}"
 
     job_dir = OUTPUT_DIR / jid
     job_dir.mkdir(parents=True, exist_ok=True)
+
+    pmode = (req.podcast_mode or "dialogue").strip().lower()
+    if pmode not in ("dialogue", "monologue"):
+        pmode = "dialogue"
+    ptype = (req.pair_type or "male_female").strip().lower()
+    if ptype not in ("male_female", "male_male", "female_female"):
+        ptype = "male_female"
+
+    if req.gemini_api_key and req.gemini_api_key.strip():
+        try:
+            (BASE_DIR / ".env").write_text(f"GEMINI_API_KEY={req.gemini_api_key.strip()}\n", encoding="utf-8")
+        except Exception:
+            pass
 
     JOBS[jid] = {
         "id": jid,
         "topic": raw_title,
         "level": lvl,
-        "category": f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
-        "podcast_mode": "dialogue",
+        "category": "⚡ TEST NHANH (480P)" if req.fast_test else f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
+        "podcast_mode": pmode,
+        "pair_type": ptype,
         "sensitivity_mode": req.sensitivity_mode,
         "custom_script": "",
+        "fast_test": bool(req.fast_test),
         "dossier": {},
         "status": "running",
         "progress": 4,
-        "message": f"Đang lập kịch bản 5 bước từ chủ đề '{raw_title}'...",
+        "message": f"Đang lập kịch bản 5 bước ({lvl}, {req.target_sentences} câu) từ chủ đề '{raw_title}'...",
         "created_at": time.strftime("%H:%M:%S"),
         "sort_ts": time.time(),
         "result": None,
@@ -214,6 +278,8 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
                 cta=req.cta,
                 gemini_api_key=req.gemini_api_key or DEFAULT_GEMINI_KEY,
                 sensitivity_mode=req.sensitivity_mode,
+                podcast_mode=pmode,
+                pair_type=ptype,
             )
             custom_script_str = dossier.get("step4_formatted", {}).get("custom_script_for_video", "")
             short_title = (dossier.get("title_vi") or raw_title).strip().upper()
@@ -225,7 +291,11 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
                 JOBS[jid]["custom_script"] = custom_script_str
                 JOBS[jid]["dossier"] = dossier
                 JOBS[jid]["progress"] = 8
-                JOBS[jid]["message"] = "Đã lập kịch bản 5 bước, đang thu âm & dựng Video 3 phần..."
+                JOBS[jid]["message"] = (
+                    "Đã lập kịch bản, đang thu âm & xuất bản Test Nhanh 480p..."
+                    if req.fast_test
+                    else "Đã lập kịch bản 5 bước, đang thu âm & dựng Video 3 phần..."
+                )
         except Exception as exc:
             if jid in JOBS:
                 JOBS[jid]["message"] = f"Đang khởi tạo kịch bản tiêu chuẩn ({exc})..."
@@ -235,13 +305,16 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
                 BatchItem(
                     topic=short_title,
                     level=lvl,
-                    category=f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
-                    podcast_mode="dialogue",
+                    category="⚡ TEST NHANH (480P)" if req.fast_test else f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
+                    podcast_mode=pmode,
+                    pair_type=ptype,
                     custom_script=custom_script_str,
                     sensitivity_mode=req.sensitivity_mode,
+                    fast_test=bool(req.fast_test),
                 )
             ],
-            podcast_mode="dialogue",
+            podcast_mode=pmode,
+            pair_type=ptype,
             subtitle_style="teleprompter",
             sensitivity_mode=req.sensitivity_mode,
             voice=req.voice,
@@ -250,6 +323,7 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
             target_sentences=req.target_sentences,
             channel_tag=req.channel_tag,
             gemini_api_key=req.gemini_api_key or DEFAULT_GEMINI_KEY,
+            fast_test=bool(req.fast_test),
         )
         await worker_run_jobs([jid], batch_req)
 
@@ -331,8 +405,89 @@ async def open_folder(job_id: str) -> Dict[str, str]:
     target = (OUTPUT_DIR / job_id).resolve()
     if not target.exists():
         target = OUTPUT_DIR
-    subprocess.Popen(["explorer.exe", str(target)])
+    if os.name == "nt":
+        subprocess.Popen(["explorer.exe", str(target)])
+    elif os.uname().sysname == "Darwin":
+        subprocess.Popen(["open", str(target)])
+    else:
+        subprocess.Popen(["xdg-open", str(target)])
     return {"status": "opened"}
+
+
+try:
+    import psutil as _psutil
+    _psutil.cpu_percent(interval=None)
+except Exception:
+    _psutil = None
+
+
+def _collect_system_stats() -> Dict[str, Any]:
+    cpu_pct = 0.0
+    ram_pct = 0.0
+    ram_used_gb = 0.0
+    ram_total_gb = 0.0
+    gpu_pct = 0.0
+    gpu_mem_mb = 0.0
+
+    if _psutil is not None:
+        try:
+            cpu_pct = round(float(_psutil.cpu_percent(interval=None)), 1)
+            vm = _psutil.virtual_memory()
+            ram_pct = round(float(vm.percent), 1)
+            ram_used_gb = round((vm.total - vm.available) / (1024 ** 3), 1)
+            ram_total_gb = round(vm.total / (1024 ** 3), 1)
+        except Exception:
+            pass
+
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                timeout=0.8,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="ignore").strip()
+            if out:
+                first_line = out.splitlines()[0].split(",")
+                gpu_pct = round(float(first_line[0].strip()), 1)
+                if len(first_line) > 1:
+                    gpu_mem_mb = round(float(first_line[1].strip()), 0)
+        except Exception:
+            pass
+    elif hasattr(os, "uname") and os.uname().sysname == "Darwin":
+        try:
+            out = subprocess.check_output(
+                ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+                timeout=0.8,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="ignore")
+            utils = [
+                int(m.group(1))
+                for m in re.finditer(r'"(?:Device|Renderer|Tiler|Device Unit \d+) Utilization %"\s*=\s*(\d+)', out)
+            ]
+            if utils:
+                gpu_pct = float(max(utils))
+            mem_matches = [
+                int(m.group(1))
+                for m in re.finditer(r'"inUse(?:Sys|Vid)MemoryBytes"\s*=\s*(\d+)', out)
+            ]
+            if mem_matches:
+                gpu_mem_mb = round(max(mem_matches) / (1024 ** 2), 0)
+        except Exception:
+            pass
+
+    return {
+        "cpu_percent": cpu_pct,
+        "ram_percent": ram_pct,
+        "ram_used_gb": ram_used_gb,
+        "ram_total_gb": ram_total_gb,
+        "gpu_percent": gpu_pct,
+        "gpu_mem_mb": gpu_mem_mb,
+    }
+
+
+@app.get("/api/system-stats")
+async def api_system_stats() -> Dict[str, Any]:
+    return await asyncio.to_thread(_collect_system_stats)
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -403,6 +558,65 @@ INDEX_HTML = r"""<!DOCTYPE html>
     color: var(--muted);
   }
 
+  /* System Telemetry Bar (CPU / RAM / GPU) */
+  .sys-telemetry {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 7px 14px;
+  }
+  .sys-metric {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 6px;
+  }
+  .sys-metric + .sys-metric {
+    border-left: 1px solid var(--border);
+    padding-left: 12px;
+  }
+  .sys-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .sys-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    min-width: 38px;
+    text-align: right;
+  }
+  .sys-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .sys-bar {
+    width: 54px;
+    height: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .sys-bar-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: var(--accent);
+    transition: width 0.35s ease, background-color 0.35s ease;
+  }
+  @media (max-width: 960px) {
+    .topbar { flex-wrap: wrap; gap: 12px; }
+    .sys-telemetry { order: 3; width: 100%; justify-content: space-around; }
+  }
+
   /* Layout */
   .workspace {
     display: grid;
@@ -434,8 +648,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   /* Mode Switcher */
   .mode-switch {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 5px;
     background: var(--input-bg);
     padding: 5px;
     border-radius: 11px;
@@ -443,22 +657,78 @@ INDEX_HTML = r"""<!DOCTYPE html>
     margin-bottom: 16px;
   }
   .mode-btn {
+    grid-column: span 2;
     background: transparent;
     color: var(--muted);
     border: none;
-    padding: 9px 10px;
+    padding: 8px 6px;
     border-radius: 8px;
     font-family: inherit;
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 700;
     cursor: pointer;
     transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .mode-btn.span-half {
+    grid-column: span 3;
   }
   .mode-btn:hover { color: var(--text); }
   .mode-btn.active {
     background: var(--panel-alt);
     color: #fff;
     box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  }
+  .dlg-sub-tabs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .pair-type-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .sub-tab-btn {
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    color: #cbd5e1;
+    border-radius: 9px;
+    padding: 9px 8px;
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: center;
+  }
+  .sub-tab-btn:hover {
+    border-color: rgba(14, 165, 233, 0.45);
+    color: #fff;
+  }
+  .sub-tab-btn.active {
+    background: rgba(14, 165, 233, 0.18);
+    border-color: var(--accent);
+    color: #38bdf8;
+    box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.25);
+  }
+  .dialogue-summary-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: rgba(14, 165, 233, 0.08);
+    border: 1px solid rgba(14, 165, 233, 0.25);
+    border-radius: 10px;
+    padding: 9px 12px;
+    margin-bottom: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .dialogue-summary-bar:hover {
+    background: rgba(14, 165, 233, 0.14);
   }
 
   /* Form Controls */
@@ -781,6 +1051,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <p>Tạo Video Luyện Nghe Tiếng Anh 3 Phần & Thumbnail Tự Động</p>
     </div>
   </div>
+
+  <div class="sys-telemetry" title="Thông số tài nguyên hệ thống theo thời gian thực">
+    <div class="sys-metric">
+      <span class="sys-label">CPU</span>
+      <div class="sys-bar"><div class="sys-bar-fill" id="barCpu"></div></div>
+      <span class="sys-val" id="valCpu">--%</span>
+    </div>
+    <div class="sys-metric">
+      <span class="sys-label">RAM</span>
+      <div class="sys-bar"><div class="sys-bar-fill" id="barRam"></div></div>
+      <span class="sys-val" id="valRam">--%</span>
+      <span class="sys-sub" id="subRam"></span>
+    </div>
+    <div class="sys-metric">
+      <span class="sys-label">GPU</span>
+      <div class="sys-bar"><div class="sys-bar-fill" id="barGpu"></div></div>
+      <span class="sys-val" id="valGpu">--%</span>
+      <span class="sys-sub" id="subGpu"></span>
+    </div>
+  </div>
+
   <button class="btn" onclick="openFolder('')">📂 Mở thư mục chứa tất cả Video</button>
 </header>
 
@@ -789,7 +1080,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <section class="panel">
     <div class="mode-switch">
       <button type="button" class="mode-btn active" id="btnModeDirect" onclick="setMode('direct')">✍️ Nhập chủ đề</button>
-      <button type="button" class="mode-btn" id="btnModeHot" onclick="setMode('hot')">🔥 Tìm chủ đề Hot</button>
+      <button type="button" class="mode-btn" id="btnModeHot" onclick="setMode('hot')">🔥 Chủ đề Hot</button>
+      <button type="button" class="mode-btn" id="btnModeDialogue" onclick="setMode('dialogue')">💬 Hội thoại</button>
+      <button type="button" class="mode-btn span-half" id="btnModeScript" onclick="setMode('script')">📋 Kịch bản sẵn</button>
+      <button type="button" class="mode-btn span-half" id="btnModeTest" onclick="setMode('test')">⚡ Test Nhanh</button>
     </div>
 
     <!-- CHẾ ĐỘ 1: NHẬP CHỦ ĐỀ TRỰC TIẾP -->
@@ -797,13 +1091,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="field">
         <div class="field-label">
           <span>Chủ đề bài nghe</span>
-          <span class="field-hint">Nhập 1 hoặc nhiều dòng</span>
+          <span class="field-hint">Kể chuyện 4 chặng + Hook ấn tượng đầu tiên</span>
         </div>
-        <textarea id="topicInput" rows="2" placeholder="VD: Bạn thân mượn tiền mãi không trả...">THÍCH THẦM</textarea>
+        <textarea id="topicInput" rows="2" placeholder="VD: Làm lốp dự phòng, bị trà xanh cắm sừng, đụng độ bb3...">CHỈ LÀ LỐP DỰ PHÒNG</textarea>
         <div class="chips">
-          <button type="button" class="chip" onclick="pickSample('THÍCH THẦM', '')">Thích thầm</button>
-          <button type="button" class="chip" onclick="pickSample('BẠN THÂN MƯỢN TIỀN KHÔNG TRẢ', 'Cho bạn vay tiền lúc khó khăn nhưng bạn khất lần 3 tháng dù vẫn đi cà phê sang chảnh.')">Bạn mượn tiền</button>
-          <button type="button" class="chip" onclick="pickSample('CÔNG CHÚA PHÒNG TRỌ', 'Bạn cùng phòng ở bẩn nhưng ra đường luôn ăn mặc lộng lẫy.')">Bạn cùng phòng</button>
+          <button type="button" class="chip" onclick="pickSample('CHỈ LÀ LỐP DỰ PHÒNG', 'Suốt 6 tháng ngày nào cũng nhắn tin ngọt ngào lúc 2h sáng nhưng khi hỏi danh phận thì chối, đến hôm nay phát hiện mình chỉ là lốp dự phòng.')">🛞 Lốp dự phòng</button>
+          <button type="button" class="chip" onclick="pickSample('BỊ TRÀ XANH CẮM SỪNG', 'Cô bạn thân luôn miệng khuyên chia tay người yêu nhưng lại âm thầm nhắn tin thả thính và cắm sừng ngay sau lưng.')">🍵 Trà xanh cắm sừng</button>
+          <button type="button" class="chip" onclick="pickSample('ĐỤNG ĐỘ BB3', 'Người yêu báo bận tăng ca nhưng lại bị bắt quả tang đang đi ăn tối lãng mạn cùng bé ba (BB3).')">💅 Đụng độ BB3</button>
+          <button type="button" class="chip" onclick="pickSample('MẬP MỜ RỒI BỊ GHOST', 'Đi chơi nắm tay như người yêu suốt 4 tháng nhưng vừa tỏ tình xong thì đối phương bỗng dưng ghost biến mất.')">👻 Mập mờ bị Ghost</button>
         </div>
       </div>
 
@@ -831,10 +1126,118 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div id="hotCandidatesList" class="cand-list"></div>
     </div>
 
+    <!-- CHẾ ĐỘ 3: TAB HỘI THOẠI (ĐỘC THOẠI / ĐỐI THOẠI & CHỌN CẶP GIỌNG) -->
+    <div id="paneDialogue" style="display:none;">
+      <div class="field">
+        <div class="field-label">
+          <span>Chế độ kể chuyện</span>
+          <span class="field-hint">Chọn Độc thoại hoặc Đối thoại</span>
+        </div>
+        <div class="dlg-sub-tabs">
+          <button type="button" class="sub-tab-btn active" id="btnSubDialogue" onclick="setPodcastMode('dialogue')">👫 Đối thoại (2 người)</button>
+          <button type="button" class="sub-tab-btn" id="btnSubMonologue" onclick="setPodcastMode('monologue')">🎙️ Độc thoại (1 người)</button>
+        </div>
+        <input type="hidden" id="podcastModeSelect" value="dialogue" />
+      </div>
+
+      <!-- KHI CHỌN ĐỐI THOẠI: CHỌN 1 TRONG 3 LOẠI CẶP + 1 CẶP GIỌNG DUY NHẤT -->
+      <div id="boxPairVoiceConfig">
+        <div class="field">
+          <div class="field-label">
+            <span>Loại cặp giọng (3 loại)</span>
+            <span class="field-hint" id="pairSpeakerHint">Anna & Tom</span>
+          </div>
+          <div class="pair-type-tabs">
+            <button type="button" class="sub-tab-btn active" id="btnPairMF" onclick="setPairType('male_female')">👫 Nam – Nữ</button>
+            <button type="button" class="sub-tab-btn" id="btnPairMM" onclick="setPairType('male_male')">👬 Nam – Nam</button>
+            <button type="button" class="sub-tab-btn" id="btnPairFF" onclick="setPairType('female_female')">👭 Nữ – Nữ</button>
+          </div>
+          <input type="hidden" id="pairTypeSelect" value="male_female" />
+        </div>
+
+        <div class="field">
+          <div class="field-label">
+            <span>Chọn cặp giọng đọc (1 cài đặt cho cả 2 giọng)</span>
+          </div>
+          <select id="voicePairSelect" onchange="updateDialogueSummary()"></select>
+        </div>
+      </div>
+
+      <!-- KHI CHỌN ĐỘC THOẠI: CHỌN 1 GIỌNG KỂ CHUYỆN -->
+      <div id="boxMonoVoiceConfig" style="display:none;">
+        <div class="field">
+          <div class="field-label">
+            <span>Chọn giọng đọc Độc thoại (1 người kể chuyện)</span>
+          </div>
+          <select id="voiceMonoSelect" onchange="updateDialogueSummary()">
+            <option value="gemini:Aoede" selected>♀️ Aoede (Nữ — Truyền cảm, kể chuyện cuốn)</option>
+            <option value="gemini:Puck">♂️ Puck (Nam — Trẻ trung, tự nhiên)</option>
+            <option value="gemini:Kore">♀️ Kore (Nữ — Trầm ấm, sâu sắc)</option>
+            <option value="gemini:Fenrir">♂️ Fenrir (Nam — Trầm điện ảnh)</option>
+            <option value="gemini:Leda">♀️ Leda (Nữ — Hiện đại, năng động)</option>
+            <option value="gemini:Charon">♂️ Charon (Nam — Điềm đạm, rõ chữ)</option>
+            <option value="gemini:Despina">♀️ Despina (Nữ — Kịch tính, cảm xúc)</option>
+            <option value="gemini:Enceladus">♂️ Enceladus (Nam — Lãng mạn, ấm áp)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- CHẾ ĐỘ 4: TAB CHUYÊN TẠO VIDEO TỪ KỊCH BẢN CÓ SẴN -->
+    <div id="paneScript" style="display:none;">
+      <div class="field">
+        <div class="field-label">
+          <span>📋 Dán kịch bản có sẵn (Song ngữ Anh | Việt)</span>
+          <span class="field-hint">Tự khớp số câu, nhân vật, cảm xúc & Level</span>
+        </div>
+        <textarea id="customScriptInput" rows="7" oninput="onCustomScriptChange('customScriptInput','customScriptAutoBadge')" placeholder="Title: CHỈ LÀ LỐP DỰ PHÒNG&#10;Anna [sad:60%]: Why do you only text me at two in the morning? | Sao anh chỉ nhắn tin cho em lúc hai giờ sáng?&#10;Tom [anxious:60%]: I was just really busy with work all day. | Cả ngày anh bận việc quá thôi mà.&#10;Anna [sad+angry:100%]: Yet you had time to post stories with her! | Vậy mà anh lại có thời gian đăng story với cô ta!"></textarea>
+        <div class="chips">
+          <button type="button" class="chip" onclick="fillSampleScript('dialogue')">👫 Mẫu Đối thoại (Anna & Tom)</button>
+          <button type="button" class="chip" onclick="fillSampleScript('monologue')">🎙️ Mẫu Độc thoại (1 người)</button>
+          <button type="button" class="chip" onclick="document.getElementById('customScriptInput').value='';onCustomScriptChange('customScriptInput','customScriptAutoBadge');">🗑️ Xoá trắng</button>
+        </div>
+        <div id="customScriptAutoBadge" style="display:none;margin-top:8px;padding:8px 11px;border-radius:8px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.35);color:#34d399;font-size:11.5px;font-weight:600;"></div>
+      </div>
+      <div class="field" style="margin-bottom:0;">
+        <div class="field-label">
+          <span>Tiêu đề bìa Thumbnail</span>
+          <span class="field-hint">Tự lấy từ kịch bản nếu để trống</span>
+        </div>
+        <input type="text" id="scriptTitleInput" placeholder="Để trống nếu kịch bản đã có dòng Title: ... hoặc tự lấy từ câu đầu" />
+      </div>
+    </div>
+
+    <!-- CHẾ ĐỘ 5: TAB TEST NHANH (CHẤT LƯỢNG VIDEO TỐI THIỂU 480P SIÊU TỐC) -->
+    <div id="paneTest" style="display:none;">
+      <div style="margin-bottom:12px;padding:9px 11px;border-radius:9px;background:rgba(14,165,233,0.1);border:1px solid rgba(56,189,248,0.3);font-size:11.5px;color:#bae6fd;line-height:1.45;">
+        ⚡ <strong>Chế độ Test Tối Thiểu (480p • 1 Phần Song Ngữ):</strong> Bỏ qua vẽ ảnh AI, bỏ qua 4K 3 phần & bản dọc/TikTok để xuất nhanh 1 video 480p (kèm nhãn <code>[cảm xúc]</code> trên màn hình) giúp bạn kiểm tra giọng đọc & kịch bản chỉ trong vài giây!
+      </div>
+      <div class="field">
+        <div class="field-label">
+          <span>Kịch bản cần Test nhanh</span>
+          <span class="field-hint">Dán kịch bản hoặc bấm nút nạp mẫu Test</span>
+        </div>
+        <textarea id="testScriptInput" rows="6" oninput="onCustomScriptChange('testScriptInput','testScriptAutoBadge')" placeholder="Dán kịch bản cần test giọng vào đây (hoặc để trống nếu muốn AI tự viết 4 câu ngắn theo chủ đề bên dưới)..."></textarea>
+        <div class="chips">
+          <button type="button" class="chip" onclick="fillTestSample('emotions')">🎭 Test 4 sắc thái (Shy / Sad / Angry / Surprised)</button>
+          <button type="button" class="chip" onclick="fillTestSample('copy_script')">📋 Lấy từ tab Kịch bản sẵn</button>
+          <button type="button" class="chip" onclick="document.getElementById('testScriptInput').value='';onCustomScriptChange('testScriptInput','testScriptAutoBadge');">🗑️ Xoá trắng</button>
+        </div>
+        <div id="testScriptAutoBadge" style="display:none;margin-top:8px;padding:8px 11px;border-radius:8px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.35);color:#34d399;font-size:11.5px;font-weight:600;"></div>
+      </div>
+      <div class="field" style="margin-bottom:0;">
+        <div class="field-label">
+          <span>Chủ đề Test (nếu không dán kịch bản)</span>
+          <span class="field-hint">Mặc định tạo 4 câu ngắn</span>
+        </div>
+        <input type="text" id="testTopicInput" value="TEST GIỌNG ĐỌC CẢM XÚC" placeholder="Nhập chủ đề ngắn để test..." />
+      </div>
+    </div>
+
     <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
 
-    <!-- CÀI ĐẶT CHUNG GỌN GÀNG (CHỈ 4 Ô CẦN THIẾT) -->
-    <div class="grid-2 field">
+    <!-- CÀI ĐẶT CHUNG GỌN GÀNG (ẨN KHI Ở TAB KỊCH BẢN SẴN / TEST NHANH) -->
+    <div class="grid-2 field" id="boxCommonSettings">
       <div>
         <div class="field-label"><span>Trình độ (Level)</span></div>
         <select id="levelSelect">
@@ -847,73 +1250,40 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </select>
       </div>
       <div>
-        <div class="field-label"><span>Thời lượng</span></div>
+        <div class="field-label"><span>Thời lượng (2 loại)</span></div>
         <select id="durationSelect">
-          <option value="8" selected>Ngắn (~2 - 3 phút)</option>
-          <option value="18">Vừa (~6 - 8 phút)</option>
-          <option value="32">Dài (~12 - 15 phút)</option>
-          <option value="52">Tập lớn (~20 phút)</option>
+          <option value="10" selected>8 - 10 câu (Ngắn)</option>
+          <option value="22">18 - 25 câu (Vừa)</option>
         </select>
       </div>
     </div>
 
-    <div class="grid-2 field">
-      <div>
-        <div class="field-label"><span>Giọng Nữ (Anna)</span></div>
-        <select id="voiceFemaleSelect">
-          <option value="gemini:Aoede" selected>Aoede (Truyền cảm)</option>
-          <option value="gemini:Kore">Kore (Trầm ấm)</option>
-          <option value="gemini:Leda">Leda (Trẻ trung)</option>
-          <option value="gemini:Zephyr">Zephyr (Hiện đại)</option>
-          <option value="gemini:Callirrhoe">Callirrhoe (Dịu dàng)</option>
-          <option value="gemini:Despina">Despina (Kịch tính)</option>
-          <option value="gemini:Autonoe">Autonoe (Rõ chữ)</option>
-          <option value="gemini:Achernar">Achernar (Sâu sắc)</option>
-          <option value="gemini:Sulafat">Sulafat (Kể chuyện)</option>
-        </select>
+    <!-- THANH TÓM TẮT HỘI THOẠI & CẶP GIỌNG (BẤM ĐỂ MỞ TAB HỘI THOẠI) -->
+    <div class="dialogue-summary-bar" onclick="setMode('dialogue')" title="Bấm để mở Tab Hội thoại & đổi cặp giọng">
+      <div style="font-size:12.5px;">
+        <span style="color:var(--muted);font-weight:600;">💬 Giọng đọc:</span>
+        <strong id="dialogueSummaryText" style="color:#f1f5f9;margin-left:4px;">Đối thoại (Nam – Nữ) • Aoede & Puck</strong>
       </div>
-      <div>
-        <div class="field-label"><span>Giọng Nam (Tom)</span></div>
-        <select id="voiceMaleSelect">
-          <option value="gemini:Puck" selected>Puck (Trẻ trung)</option>
-          <option value="gemini:Fenrir">Fenrir (Trầm điện ảnh)</option>
-          <option value="gemini:Charon">Charon (Điềm đạm)</option>
-          <option value="gemini:Enceladus">Enceladus (Lãng mạn)</option>
-          <option value="gemini:Orus">Orus (Dứt khoát)</option>
-          <option value="gemini:Iapetus">Iapetus (Thân thiện)</option>
-          <option value="gemini:Umbriel">Umbriel (Thư thái)</option>
-          <option value="gemini:Achird">Achird (Năng động)</option>
-          <option value="gemini:Algenib">Algenib (Trầm sâu)</option>
-        </select>
-      </div>
+      <span style="font-size:11.5px;color:#38bdf8;font-weight:700;">Đổi giọng ➔</span>
     </div>
 
     <!-- TUỲ CHỌN MỞ RỘNG (ẨN GỌN MẶC ĐỊNH) -->
     <details class="adv-drawer">
-      <summary>⚙️ Tuỳ chọn nâng cao (Phong cách, Kịch bản có sẵn...)</summary>
-      <div class="grid-2 field">
-        <div>
-          <div class="field-label"><span>Mức độ nội dung</span></div>
-          <select id="sensitivitySelect">
-            <option value="normal" selected>🙂 Đời thường tự nhiên</option>
-            <option value="sensitive_ok">🌶️ Drama / Nhạy cảm</option>
-            <option value="polite">😇 Lịch sự / Học đường</option>
-          </select>
-        </div>
-        <div>
-          <div class="field-label"><span>Số người đọc</span></div>
-          <select id="podcastModeSelect">
-            <option value="dialogue" selected>👫 2 Người (Anna & Tom)</option>
-            <option value="monologue">🎙️ 1 Người (Độc thoại)</option>
-          </select>
-        </div>
+      <summary>⚙️ Tuỳ chọn nâng cao (Phong cách, API Key...)</summary>
+      <div class="field">
+        <div class="field-label"><span>Mức độ nội dung</span></div>
+        <select id="sensitivitySelect">
+          <option value="normal" selected>🙂 Đời thường tự nhiên</option>
+          <option value="sensitive_ok">🌶️ Drama / Nhạy cảm</option>
+          <option value="polite">😇 Lịch sự / Học đường</option>
+        </select>
       </div>
       <div class="field" style="margin-bottom:0;">
         <div class="field-label">
-          <span>Tự dán kịch bản có sẵn</span>
-          <span class="field-hint">Để trống nếu AI tự viết</span>
+          <span>🔑 Gemini API Key</span>
+          <span class="field-hint">Tự động lưu vào file .env</span>
         </div>
-        <textarea id="customScriptInput" rows="3" placeholder="Anna: Hello Tom! | Chào Tom!&#10;Tom: Hi Anna! | Chào Anna!"></textarea>
+        <input type="password" id="geminiKeyInput" placeholder="Dán mã AIzaSy... (nếu có) để bật giọng Gemini Live & AI tốc độ cao" />
       </div>
     </details>
 
@@ -940,6 +1310,32 @@ const DEFAULT_API_KEY = "";
 let currentMode = 'direct';
 let hotCandidates = [];
 let isScanningHot = false;
+let isCreatingVideo = false;
+
+const VOICE_PAIRS = {
+  male_female: [
+    { value: "gemini:Aoede|gemini:Puck", label: "Cặp 1: Aoede (Nữ truyền cảm) & Puck (Nam trẻ trung)" },
+    { value: "gemini:Kore|gemini:Fenrir", label: "Cặp 2: Kore (Nữ trầm ấm) & Fenrir (Nam điện ảnh)" },
+    { value: "gemini:Leda|gemini:Charon", label: "Cặp 3: Leda (Nữ năng động) & Charon (Nam điềm đạm)" },
+    { value: "gemini:Despina|gemini:Enceladus", label: "Cặp 4: Despina (Nữ kịch tính) & Enceladus (Nam lãng mạn)" },
+    { value: "gemini:Callirrhoe|gemini:Orus", label: "Cặp 5: Callirrhoe (Nữ dịu dàng) & Orus (Nam dứt khoát)" },
+    { value: "gemini:Zephyr|gemini:Iapetus", label: "Cặp 6: Zephyr (Nữ hiện đại) & Iapetus (Nam thân thiện)" }
+  ],
+  male_male: [
+    { value: "gemini:Puck|gemini:Fenrir", label: "Cặp 1: Puck (Nam trẻ trung) & Fenrir (Nam trầm điện ảnh)" },
+    { value: "gemini:Charon|gemini:Orus", label: "Cặp 2: Charon (Nam điềm đạm) & Orus (Nam dứt khoát)" },
+    { value: "gemini:Enceladus|gemini:Iapetus", label: "Cặp 3: Enceladus (Nam ấm áp) & Iapetus (Nam thân thiện)" },
+    { value: "gemini:Umbriel|gemini:Achird", label: "Cặp 4: Umbriel (Nam thư thái) & Achird (Nam năng động)" },
+    { value: "gemini:Puck|gemini:Algenib", label: "Cặp 5: Puck (Nam tự nhiên) & Algenib (Nam trầm sâu)" }
+  ],
+  female_female: [
+    { value: "gemini:Aoede|gemini:Leda", label: "Cặp 1: Aoede (Nữ truyền cảm) & Leda (Nữ trẻ trung)" },
+    { value: "gemini:Kore|gemini:Despina", label: "Cặp 2: Kore (Nữ trầm ấm) & Despina (Nữ kịch tính)" },
+    { value: "gemini:Callirrhoe|gemini:Zephyr", label: "Cặp 3: Callirrhoe (Nữ dịu dàng) & Zephyr (Nữ hiện đại)" },
+    { value: "gemini:Autonoe|gemini:Sulafat", label: "Cặp 4: Autonoe (Nữ rõ chữ) & Sulafat (Nữ kể chuyện)" },
+    { value: "gemini:Aoede|gemini:Achernar", label: "Cặp 5: Aoede (Nữ tự nhiên) & Achernar (Nữ sâu sắc)" }
+  ]
+};
 
 function showToast(msg) {
   const t = document.getElementById('toast');
@@ -952,22 +1348,240 @@ function setMode(m) {
   currentMode = m;
   document.getElementById('btnModeDirect').classList.toggle('active', m === 'direct');
   document.getElementById('btnModeHot').classList.toggle('active', m === 'hot');
+  document.getElementById('btnModeDialogue').classList.toggle('active', m === 'dialogue');
+  document.getElementById('btnModeScript').classList.toggle('active', m === 'script');
+  document.getElementById('btnModeTest').classList.toggle('active', m === 'test');
+
   document.getElementById('paneDirect').style.display = (m === 'direct') ? 'block' : 'none';
   document.getElementById('paneHot').style.display = (m === 'hot') ? 'block' : 'none';
+  document.getElementById('paneDialogue').style.display = (m === 'dialogue') ? 'block' : 'none';
+  document.getElementById('paneScript').style.display = (m === 'script') ? 'block' : 'none';
+  document.getElementById('paneTest').style.display = (m === 'test') ? 'block' : 'none';
+
+  const commonBox = document.getElementById('boxCommonSettings');
+  if (commonBox) {
+    commonBox.style.display = (m === 'script' || m === 'test') ? 'none' : 'grid';
+  }
+
   const createBtn = document.getElementById('createBtn');
   if (m === 'hot') {
     createBtn.innerHTML = '🔍 Quét 5 Chủ Đề Đang Hot Trên Mạng';
     if (hotCandidates.length === 0 && !isScanningHot) {
       scanHotTopics();
     }
+  } else if (m === 'script') {
+    createBtn.innerHTML = '📋 Tạo Video Từ Kịch Bản Sẵn';
+  } else if (m === 'test') {
+    createBtn.innerHTML = '⚡ Tạo Video Test Tối Thiểu (480p Siêu Tốc)';
   } else {
     createBtn.innerHTML = '🚀 Tạo Video Ngay';
   }
 }
 
+function setPodcastMode(pmode) {
+  document.getElementById('podcastModeSelect').value = pmode;
+  document.getElementById('btnSubDialogue').classList.toggle('active', pmode === 'dialogue');
+  document.getElementById('btnSubMonologue').classList.toggle('active', pmode === 'monologue');
+  document.getElementById('boxPairVoiceConfig').style.display = (pmode === 'dialogue') ? 'block' : 'none';
+  document.getElementById('boxMonoVoiceConfig').style.display = (pmode === 'monologue') ? 'block' : 'none';
+  updateDialogueSummary();
+}
+
+function setPairType(ptype) {
+  document.getElementById('pairTypeSelect').value = ptype;
+  document.getElementById('btnPairMF').classList.toggle('active', ptype === 'male_female');
+  document.getElementById('btnPairMM').classList.toggle('active', ptype === 'male_male');
+  document.getElementById('btnPairFF').classList.toggle('active', ptype === 'female_female');
+
+  const hintEl = document.getElementById('pairSpeakerHint');
+  if (ptype === 'male_male') hintEl.textContent = '2 Giọng Nam (Tom & Jack)';
+  else if (ptype === 'female_female') hintEl.textContent = '2 Giọng Nữ (Anna & Mia)';
+  else hintEl.textContent = 'Nam & Nữ (Anna & Tom)';
+
+  const sel = document.getElementById('voicePairSelect');
+  const pairs = VOICE_PAIRS[ptype] || VOICE_PAIRS.male_female;
+  sel.innerHTML = pairs.map((p, idx) => `<option value="${p.value}" ${idx === 0 ? 'selected' : ''}>${p.label}</option>`).join('');
+  updateDialogueSummary();
+}
+
+function getSelectedVoiceConfig() {
+  const podcast_mode = document.getElementById('podcastModeSelect').value || 'dialogue';
+  const pair_type = document.getElementById('pairTypeSelect').value || 'male_female';
+  if (podcast_mode === 'monologue') {
+    const monoVoice = document.getElementById('voiceMonoSelect').value || 'gemini:Aoede';
+    return { podcast_mode, pair_type, voice: monoVoice, voice_male: monoVoice };
+  }
+  const rawPair = document.getElementById('voicePairSelect').value || 'gemini:Aoede|gemini:Puck';
+  const parts = rawPair.split('|');
+  return {
+    podcast_mode,
+    pair_type,
+    voice: parts[0] || 'gemini:Aoede',
+    voice_male: parts[1] || parts[0] || 'gemini:Puck'
+  };
+}
+
+function updateDialogueSummary() {
+  const cfg = getSelectedVoiceConfig();
+  const sumEl = document.getElementById('dialogueSummaryText');
+  if (!sumEl) return;
+  if (cfg.podcast_mode === 'monologue') {
+    const vName = cfg.voice.replace('gemini:', '');
+    sumEl.textContent = `Độc thoại (1 người) • Giọng ${vName}`;
+  } else {
+    const typeLabel = cfg.pair_type === 'male_male' ? 'Nam – Nam' : (cfg.pair_type === 'female_female' ? 'Nữ – Nữ' : 'Nam – Nữ');
+    const v1 = cfg.voice.replace('gemini:', '');
+    const v2 = cfg.voice_male.replace('gemini:', '');
+    sumEl.textContent = `Đối thoại (${typeLabel}) • ${v1} & ${v2}`;
+  }
+}
+
+// Khởi tạo danh sách cặp giọng mặc định
+setPairType('male_female');
+
 function pickSample(topic, desc) {
   document.getElementById('topicInput').value = topic;
   document.getElementById('descInput').value = desc || '';
+}
+
+function fillSampleScript(type) {
+  const el = document.getElementById('customScriptInput');
+  if (type === 'monologue') {
+    el.value = [
+      "Title: MẬP MỜ RỒI BỊ GHOST",
+      "[sad:60%]: For four months, we walked home together holding hands every evening. | Suốt bốn tháng trời, tối nào tụi mình cũng nắm tay nhau đi bộ về nhà.",
+      "[happy+anxious:60%]: Last night, I finally told him that I wanted to be his girlfriend. | Tối hôm qua, cuối cùng mình cũng lấy hết can đảm nói rằng muốn làm bạn gái anh ấy.",
+      "[surprised:100%]: This morning, his account was gone and my number was blocked. | Sáng nay tỉnh dậy, tài khoản của anh ấy đã biến mất và số của mình cũng bị chặn.",
+      "[sad+angry:60%]: I was never his love, just someone to fill his lonely nights. | Hoá ra mình chưa bao giờ là tình yêu, chỉ là người lấp đầy những đêm cô đơn của anh ta."
+    ].join('\n');
+  } else {
+    el.value = [
+      "Title: CHỈ LÀ LỐP DỰ PHÒNG",
+      "Anna [shy:60%]: Tom, why do you only text me late at night when you feel lonely? | Tom này, sao anh chỉ nhắn tin cho em vào đêm muộn mỗi khi anh thấy cô đơn?",
+      "Tom [anxious:60%]: That is not true, I am just really busy with work during the day. | Không phải vậy đâu, chỉ là ban ngày anh bận việc quá thôi mà.",
+      "Anna [surprised:100%]: Then why did I see you holding Mia's hand at the coffee shop today? | Vậy tại sao hôm nay em lại thấy anh nắm tay Mia ở quán cà phê?",
+      "Tom [shy:60%]: Anna, please listen, I did not want to hurt your feelings. | Anna, nghe anh giải thích đã, anh không muốn làm tổn thương cảm xúc của em.",
+      "Anna [sad+angry:100%]: Stop lying! I am done being your backup plan! | Đừng nói dối nữa! Em chấm dứt cảnh làm lốp dự phòng của anh tại đây!"
+    ].join('\n');
+  }
+  onCustomScriptChange('customScriptInput', 'customScriptAutoBadge');
+}
+
+function fillTestSample(type) {
+  const testEl = document.getElementById('testScriptInput');
+  if (type === 'copy_script') {
+    const src = (document.getElementById('customScriptInput').value || '').trim();
+    if (!src) {
+      showToast('⚠️ Ô Kịch bản sẵn đang trống, đã nạp mẫu Test 4 câu!');
+      fillTestSample('emotions');
+      return;
+    }
+    testEl.value = src;
+  } else {
+    testEl.value = [
+      "Title: TEST 4 SẮC THÁI GIỌNG ĐỌC",
+      "Anna [shy:60%]: I think it's Jack from class B. He always smiles at me. | Tớ nghĩ là Jack lớp B. Cậu ấy lúc nào cũng cười với tớ.",
+      "Tom [sad:60%]: Oh... I see. I hope he makes you really happy. | Ồ... tớ hiểu rồi. Tớ mong cậu ấy sẽ làm cậu thật hạnh phúc.",
+      "Anna [surprised:100%]: Wait, Tom! Why are you holding that yellow note in your hand? | Khoan đã Tom! Sao cậu lại cầm tờ giấy nhắn màu vàng đó trên tay?",
+      "Tom [happy+anxious:60%]: Because I was the one leaving notes in your umbrella every rainy day. | Vì chính tớ là người đã để giấy nhắn vào ô của cậu mỗi ngày mưa đấy."
+    ].join('\n');
+  }
+  onCustomScriptChange('testScriptInput', 'testScriptAutoBadge');
+}
+
+function onCustomScriptChange(inputId = 'customScriptInput', badgeId = 'customScriptAutoBadge') {
+  const inp = document.getElementById(inputId);
+  const raw = (inp ? inp.value : '').trim();
+  const badge = document.getElementById(badgeId);
+  if (!raw) {
+    if (badge) badge.style.display = 'none';
+    return;
+  }
+
+  let detectedTitle = '';
+  let explicitLevel = '';
+  const speakers = new Set();
+  let lineCount = 0;
+  let totalWords = 0;
+
+  for (const rawLine of raw.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const mTitle = line.match(/^(?:title|tiêu\s*đề|chủ\s*đề|#)\s*[:\-]?\s*(.+)$/i);
+    if (mTitle && lineCount === 0 && !line.includes('|')) {
+      detectedTitle = mTitle[1].trim();
+      continue;
+    }
+    const mLvl = line.match(/^(?:level|trình\s*độ)\s*[:\-]\s*(A1|A2|B1|B2|C1|C2)\b/i);
+    if (mLvl && lineCount === 0) {
+      explicitLevel = mLvl[1].toUpperCase();
+      continue;
+    }
+    const enPart = line.split('|')[0].trim();
+    const mSp = enPart.match(/^(Anna|Tom|Jack|Mia|Speaker\s*[AB12]|Nữ|Nam)\s*(?:[\[\(][^\]\)]+[\]\)])?\s*:\s*(.+)$/i);
+    let cleanEn = enPart;
+    if (mSp) {
+      const spRaw = mSp[1].trim().toLowerCase();
+      if (spRaw === 'jack') speakers.add('Jack');
+      else if (spRaw === 'mia') speakers.add('Mia');
+      else if (['tom', 'speaker b', 'speaker 2', 'nam'].includes(spRaw)) speakers.add('Tom');
+      else speakers.add('Anna');
+      cleanEn = mSp[2].trim();
+    } else {
+      cleanEn = enPart.replace(/^[\[\(][^\]\)]+[\]\)]\s*:?\s*/, '').trim();
+    }
+    if (cleanEn) {
+      lineCount++;
+      totalWords += cleanEn.split(/\s+/).filter(Boolean).length;
+    }
+  }
+
+  if (detectedTitle) {
+    if (inputId === 'customScriptInput') {
+      const stEl = document.getElementById('scriptTitleInput');
+      if (stEl && !stEl.value.trim()) stEl.value = detectedTitle;
+    } else if (inputId === 'testScriptInput') {
+      const ttEl = document.getElementById('testTopicInput');
+      if (ttEl) ttEl.value = detectedTitle;
+    }
+  }
+
+  let autoLevel = explicitLevel;
+  if (!autoLevel && lineCount > 0) {
+    const avg = totalWords / lineCount;
+    if (avg <= 6.5) autoLevel = 'A1';
+    else if (avg <= 8.5) autoLevel = 'A2';
+    else if (avg <= 11.5) autoLevel = 'B1';
+    else if (avg <= 14.0) autoLevel = 'B2';
+    else if (avg <= 16.5) autoLevel = 'C1';
+    else autoLevel = 'C2';
+  }
+  if (autoLevel) {
+    document.getElementById('levelSelect').value = autoLevel;
+  }
+
+  let modeLabel = 'Đối thoại (Anna & Tom)';
+  if (speakers.size <= 1) {
+    setPodcastMode('monologue');
+    modeLabel = 'Độc thoại (1 người)';
+  } else {
+    setPodcastMode('dialogue');
+    if (speakers.has('Tom') && speakers.has('Jack')) {
+      setPairType('male_male');
+      modeLabel = 'Đối thoại Nam – Nam (Tom & Jack)';
+    } else if (speakers.has('Anna') && speakers.has('Mia')) {
+      setPairType('female_female');
+      modeLabel = 'Đối thoại Nữ – Nữ (Anna & Mia)';
+    } else {
+      setPairType('male_female');
+      modeLabel = 'Đối thoại Nam – Nữ (Anna & Tom)';
+    }
+  }
+
+  if (badge && lineCount > 0) {
+    badge.style.display = 'block';
+    badge.textContent = `✅ Đã khớp từ kịch bản: ${lineCount} câu • ${modeLabel} • Trình độ ${autoLevel || 'B1'} — Bạn chỉ cần chọn Giọng đọc!`;
+  }
 }
 
 async function handleCreateVideo() {
@@ -975,20 +1589,56 @@ async function handleCreateVideo() {
     await scanHotTopics();
     return;
   }
-  const topicRaw = document.getElementById('topicInput').value.trim();
-  const desc = document.getElementById('descInput').value.trim();
-  if (!topicRaw) {
-    alert('Vui lòng nhập chủ đề bài nghe!');
-    return;
+  if (isCreatingVideo) return;
+
+  const isFastTest = (currentMode === 'test');
+  let custom_script = '';
+  let topicRaw = '';
+  let desc = '';
+
+  if (currentMode === 'script') {
+    custom_script = (document.getElementById('customScriptInput').value || '').trim();
+    if (!custom_script) {
+      alert('Vui lòng dán kịch bản có sẵn vào ô Kịch bản (hoặc bấm nút Mẫu Đối thoại / Độc thoại)!');
+      return;
+    }
+    onCustomScriptChange('customScriptInput', 'customScriptAutoBadge');
+    topicRaw = (document.getElementById('scriptTitleInput').value || '').trim() || 'KỊCH BẢN CÓ SẴN';
+  } else if (currentMode === 'test') {
+    custom_script = (document.getElementById('testScriptInput').value || '').trim();
+    if (custom_script) {
+      onCustomScriptChange('testScriptInput', 'testScriptAutoBadge');
+    }
+    topicRaw = (document.getElementById('testTopicInput').value || '').trim() || 'BẢN TEST NHANH';
+  } else {
+    custom_script = (document.getElementById('customScriptInput').value || '').trim();
+    if (custom_script) {
+      onCustomScriptChange('customScriptInput', 'customScriptAutoBadge');
+    }
+    topicRaw = (document.getElementById('topicInput').value || '').trim();
+    desc = (document.getElementById('descInput').value || '').trim();
+    if (!topicRaw && custom_script) {
+      topicRaw = 'KỊCH BẢN CÓ SẴN';
+    }
+    if (!topicRaw) {
+      setMode('direct');
+      alert('Vui lòng nhập chủ đề bài nghe!');
+      return;
+    }
   }
 
+  isCreatingVideo = true;
+
   const level = document.getElementById('levelSelect').value;
-  const target_sentences = parseInt(document.getElementById('durationSelect').value, 10) || 10;
-  const voice = document.getElementById('voiceFemaleSelect').value;
-  const voice_male = document.getElementById('voiceMaleSelect').value;
+  const target_sentences = isFastTest ? 4 : (parseInt(document.getElementById('durationSelect').value, 10) || 10);
+  const voiceCfg = getSelectedVoiceConfig();
+  const podcast_mode = voiceCfg.podcast_mode;
+  const pair_type = voiceCfg.pair_type;
+  const voice = voiceCfg.voice;
+  const voice_male = voiceCfg.voice_male;
   const sensitivity_mode = document.getElementById('sensitivitySelect').value;
-  const podcast_mode = document.getElementById('podcastModeSelect').value;
-  const custom_script = document.getElementById('customScriptInput').value.trim();
+  const keyEl = document.getElementById('geminiKeyInput');
+  const gemini_api_key = (keyEl && keyEl.value.trim()) ? keyEl.value.trim() : DEFAULT_API_KEY;
 
   const btn = document.getElementById('createBtn');
   const statusEl = document.getElementById('createStatusMsg');
@@ -996,9 +1646,10 @@ async function handleCreateVideo() {
 
   try {
     const lines = topicRaw.split('\n').map(l => l.trim()).filter(Boolean);
-    // Nếu người dùng nhập 1 chủ đề kèm mô tả tình huống (và không dán kịch bản sẵn), dùng quy trình biên kịch sâu Mode A
-    if (lines.length === 1 && desc && !custom_script && !lines[0].includes('|')) {
-      statusEl.textContent = '⏳ Đang khởi tạo kịch bản 5 bước và dựng video...';
+    if (lines.length === 1 && !custom_script && !lines[0].includes('|')) {
+      statusEl.textContent = isFastTest
+        ? `⚡ Đang tạo nhanh 4 câu test & dựng video 480p tối thiểu...`
+        : `⏳ Đang khởi tạo kịch bản (${level}, ${target_sentences} câu, ${podcast_mode === 'monologue' ? 'Độc thoại' : 'Đối thoại'})...`;
       await fetch('/api/mode-ab/create', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -1008,26 +1659,33 @@ async function handleCreateVideo() {
           description: desc,
           level,
           target_sentences,
+          podcast_mode,
+          pair_type,
           cta: 'Đăng ký kênh UNI PODCAST và bình luận ý kiến của bạn bên dưới',
           sensitivity_mode,
           voice,
           voice_male,
-          rate: '-12%',
+          rate: '+0%',
           channel_tag: 'UNI PODCAST',
-          gemini_api_key: DEFAULT_API_KEY
+          gemini_api_key,
+          fast_test: isFastTest
         })
       });
     } else {
-      statusEl.textContent = '⏳ Đã đưa vào hàng đợi sản xuất video...';
+      statusEl.textContent = isFastTest
+        ? '⚡ Đang thu âm & xuất video 480p tối thiểu để test...'
+        : '⏳ Đã đưa vào hàng đợi sản xuất video từ kịch bản sẵn...';
       const items = lines.map((line, idx) => {
         const parts = line.split('|').map(x => x.trim());
         return {
           topic: parts[0] || 'CHỦ ĐỀ MỚI',
           level: parts[1] || level,
-          category: parts[2] || 'TIẾNG ANH THỰC TẾ',
+          category: isFastTest ? '⚡ TEST NHANH (480P)' : (parts[2] || 'KỊCH BẢN CÓ SẴN'),
           podcast_mode,
+          pair_type,
           sensitivity_mode,
-          custom_script: idx === 0 ? custom_script : ''
+          custom_script: idx === 0 ? custom_script : '',
+          fast_test: isFastTest
         };
       });
       await fetch('/api/batch', {
@@ -1036,23 +1694,26 @@ async function handleCreateVideo() {
         body: JSON.stringify({
           items,
           podcast_mode,
-          subtitle_style: 'teleprompter',
+          pair_type,
+          subtitle_style: isFastTest ? 'static' : 'teleprompter',
           sensitivity_mode,
           voice,
           voice_male,
-          rate: '-12%',
+          rate: '+0%',
           target_sentences,
           channel_tag: 'UNI PODCAST',
-          gemini_api_key: DEFAULT_API_KEY
+          gemini_api_key,
+          fast_test: isFastTest
         })
       });
     }
     statusEl.textContent = '';
-    showToast('🚀 Đã bắt đầu dựng video! Xem tiến độ bên phải.');
+    showToast(isFastTest ? '⚡ Đã bắt đầu dựng Video Test 480p siêu tốc!' : '🚀 Đã bắt đầu dựng video! Xem tiến độ bên phải.');
     await refreshJobs();
   } catch (e) {
     statusEl.textContent = 'Lỗi: ' + e.message;
   } finally {
+    isCreatingVideo = false;
     btn.disabled = false;
   }
 }
@@ -1107,7 +1768,7 @@ async function scanHotTopics() {
               <p>${c.description || ''}</p>
             </div>
             <button type="button" class="btn btn-primary-soft" style="flex-shrink:0;" onclick="selectHotCandidate(${idx})">
-              🎬 Chọn & Tạo
+              ✍️ Chọn chủ đề
             </button>
           </div>
         `;
@@ -1132,7 +1793,7 @@ async function selectHotCandidate(idx) {
   document.getElementById('topicInput').value = c.topic || '';
   document.getElementById('descInput').value = c.description || '';
   setMode('direct');
-  await handleCreateVideo();
+  showToast('✍️ Đã điền chủ đề! Chỉnh cài đặt bên dưới rồi bấm "Tạo Video Ngay".');
 }
 
 function mmssToSec(mmss) {
@@ -1305,8 +1966,61 @@ async function refreshJobs() {
   }
 }
 
+function pickBarColor(pct) {
+  if (pct >= 85) return '#ef4444';
+  if (pct >= 65) return '#f59e0b';
+  return '#0ea5e9';
+}
+
+async function refreshSystemStats() {
+  try {
+    const res = await fetch('/api/system-stats');
+    if (!res.ok) return;
+    const s = await res.json();
+    const cpu = Math.min(100, Math.max(0, Number(s.cpu_percent || 0)));
+    const ram = Math.min(100, Math.max(0, Number(s.ram_percent || 0)));
+    const gpu = Math.min(100, Math.max(0, Number(s.gpu_percent || 0)));
+
+    const valCpu = document.getElementById('valCpu');
+    const barCpu = document.getElementById('barCpu');
+    if (valCpu) valCpu.textContent = `${cpu.toFixed(0)}%`;
+    if (barCpu) {
+      barCpu.style.width = `${cpu}%`;
+      barCpu.style.backgroundColor = pickBarColor(cpu);
+    }
+
+    const valRam = document.getElementById('valRam');
+    const barRam = document.getElementById('barRam');
+    const subRam = document.getElementById('subRam');
+    if (valRam) valRam.textContent = `${ram.toFixed(0)}%`;
+    if (barRam) {
+      barRam.style.width = `${ram}%`;
+      barRam.style.backgroundColor = pickBarColor(ram);
+    }
+    if (subRam && s.ram_total_gb > 0) {
+      subRam.textContent = `(${s.ram_used_gb}/${s.ram_total_gb}GB)`;
+    }
+
+    const valGpu = document.getElementById('valGpu');
+    const barGpu = document.getElementById('barGpu');
+    const subGpu = document.getElementById('subGpu');
+    if (valGpu) valGpu.textContent = `${gpu.toFixed(0)}%`;
+    if (barGpu) {
+      barGpu.style.width = `${gpu}%`;
+      barGpu.style.backgroundColor = pickBarColor(gpu);
+    }
+    if (subGpu && s.gpu_mem_mb > 0) {
+      subGpu.textContent = s.gpu_mem_mb >= 1024
+        ? `(${(s.gpu_mem_mb / 1024).toFixed(1)}GB)`
+        : `(${Math.round(s.gpu_mem_mb)}MB)`;
+    }
+  } catch (_) {}
+}
+
 setInterval(refreshJobs, 1500);
+setInterval(refreshSystemStats, 2000);
 refreshJobs();
+refreshSystemStats();
 </script>
 </body>
 </html>

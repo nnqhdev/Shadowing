@@ -44,10 +44,48 @@ MALE_VOICES = [
 ]
 
 DURATIONS = [
-    ("Ngắn (~2 - 3 phút)", 8),
-    ("Vừa (~6 - 8 phút)", 18),
-    ("Dài (~12 - 15 phút)", 32),
-    ("Tập lớn (~20 phút)", 52),
+    ("8 - 10 câu (Ngắn)", 10),
+    ("18 - 25 câu (Vừa)", 22),
+]
+
+PAIR_TYPES = [
+    ("👫 Nam – Nữ (Anna & Tom)", "male_female"),
+    ("👬 Nam – Nam (Tom & Jack)", "male_male"),
+    ("👭 Nữ – Nữ (Anna & Mia)", "female_female"),
+]
+
+VOICE_PAIRS_BY_TYPE = {
+    "male_female": [
+        ("Cặp 1: Aoede (Nữ truyền cảm) & Puck (Nam trẻ trung)", "gemini:Aoede|gemini:Puck"),
+        ("Cặp 2: Kore (Nữ trầm ấm) & Fenrir (Nam điện ảnh)", "gemini:Kore|gemini:Fenrir"),
+        ("Cặp 3: Leda (Nữ năng động) & Charon (Nam điềm đạm)", "gemini:Leda|gemini:Charon"),
+        ("Cặp 4: Despina (Nữ kịch tính) & Enceladus (Nam lãng mạn)", "gemini:Despina|gemini:Enceladus"),
+        ("Cặp 5: Callirrhoe (Nữ dịu dàng) & Orus (Nam dứt khoát)", "gemini:Callirrhoe|gemini:Orus"),
+        ("Cặp 6: Zephyr (Nữ hiện đại) & Iapetus (Nam thân thiện)", "gemini:Zephyr|gemini:Iapetus"),
+    ],
+    "male_male": [
+        ("Cặp 1: Puck (Nam trẻ trung) & Fenrir (Nam điện ảnh)", "gemini:Puck|gemini:Fenrir"),
+        ("Cặp 2: Charon (Nam điềm đạm) & Orus (Nam dứt khoát)", "gemini:Charon|gemini:Orus"),
+        ("Cặp 3: Enceladus (Nam ấm áp) & Iapetus (Nam thân thiện)", "gemini:Enceladus|gemini:Iapetus"),
+        ("Cặp 4: Umbriel (Nam thư thái) & Achird (Nam năng động)", "gemini:Umbriel|gemini:Achird"),
+        ("Cặp 5: Puck (Nam tự nhiên) & Algenib (Nam trầm sâu)", "gemini:Puck|gemini:Algenib"),
+    ],
+    "female_female": [
+        ("Cặp 1: Aoede (Nữ truyền cảm) & Leda (Nữ trẻ trung)", "gemini:Aoede|gemini:Leda"),
+        ("Cặp 2: Kore (Nữ trầm ấm) & Despina (Nữ kịch tính)", "gemini:Kore|gemini:Despina"),
+        ("Cặp 3: Callirrhoe (Nữ dịu dàng) & Zephyr (Nữ hiện đại)", "gemini:Callirrhoe|gemini:Zephyr"),
+        ("Cặp 4: Autonoe (Nữ rõ chữ) & Sulafat (Nữ kể chuyện)", "gemini:Autonoe|gemini:Sulafat"),
+        ("Cặp 5: Aoede (Nữ tự nhiên) & Achernar (Nữ sâu sắc)", "gemini:Aoede|gemini:Achernar"),
+    ],
+}
+
+MONO_VOICES = [
+    ("♀️ Aoede (Nữ — Truyền cảm)", "gemini:Aoede"),
+    ("♂️ Puck (Nam — Trẻ trung)", "gemini:Puck"),
+    ("♀️ Kore (Nữ — Trầm ấm)", "gemini:Kore"),
+    ("♂️ Fenrir (Nam — Trầm điện ảnh)", "gemini:Fenrir"),
+    ("♀️ Leda (Nữ — Hiện đại)", "gemini:Leda"),
+    ("♂️ Charon (Nam — Điềm đạm)", "gemini:Charon"),
 ]
 
 LEVELS = [
@@ -71,8 +109,13 @@ PODCAST_MODES = [
 ]
 
 
+_BACKEND_THREAD_LOCK = threading.Lock()
+_BACKEND_SERVER_STARTING = False
+
+
 def ensure_backend_running() -> None:
-    """Start FastAPI backend in a daemon thread if not already listening on 8095."""
+    """Start FastAPI backend as an independent background process if not already listening on 8095."""
+    global _BACKEND_SERVER_STARTING
     try:
         with urllib.request.urlopen(f"{API_BASE}/api/jobs", timeout=1.2) as r:
             if r.status == 200:
@@ -80,21 +123,34 @@ def ensure_backend_running() -> None:
     except Exception:
         pass
 
-    def _run_server():
-        import uvicorn
-        from app import app
-        uvicorn.run(app, host="127.0.0.1", port=8095, log_level="warning")
+    with _BACKEND_THREAD_LOCK:
+        if _BACKEND_SERVER_STARTING:
+            return
+        _BACKEND_SERVER_STARTING = True
 
-    t = threading.Thread(target=_run_server, daemon=True)
-    t.start()
-    for _ in range(25):
-        time.sleep(0.25)
-        try:
-            with urllib.request.urlopen(f"{API_BASE}/api/jobs", timeout=1.0) as r:
-                if r.status == 200:
-                    return
-        except Exception:
-            pass
+    try:
+        popen_kwargs = {
+            "cwd": str(BASE_DIR),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        subprocess.Popen([sys.executable, "-X", "utf8", str(BASE_DIR / "app.py")], **popen_kwargs)
+
+        for _ in range(25):
+            time.sleep(0.25)
+            try:
+                with urllib.request.urlopen(f"{API_BASE}/api/jobs", timeout=1.0) as r:
+                    if r.status == 200:
+                        return
+            except Exception:
+                pass
+    finally:
+        _BACKEND_SERVER_STARTING = False
 
 
 def api_request(path: str, method: str = "GET", payload: dict | None = None):
@@ -228,6 +284,19 @@ class UniPodcastDesktopApp(tk.Tk):
             bg=self.c_card,
         ).pack(side="right")
 
+        self.lbl_sys_stats = tk.Label(
+            hdr_btns,
+            text="CPU: --%  |  RAM: --%  |  GPU: --%",
+            font=("Consolas", 9, "bold"),
+            bg=self.c_panel,
+            fg="#38bdf8",
+            padx=12,
+            pady=6,
+            highlightthickness=1,
+            highlightbackground="#262b38",
+        )
+        self.lbl_sys_stats.pack(side="right", padx=(0, 10))
+
         sep = tk.Frame(self, bg="#262b38", height=1)
         sep.pack(fill="x", padx=22)
 
@@ -242,16 +311,17 @@ class UniPodcastDesktopApp(tk.Tk):
         left = tk.Frame(main, bg=self.c_panel, padx=18, pady=16, highlightthickness=1, highlightbackground="#262b38")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
 
-        # Mode Switcher (Direct vs Hot AI)
+        # Mode Switcher (Direct vs Hot AI vs Dialogue)
         mode_bar = tk.Frame(left, bg=self.c_input, padx=4, pady=4)
         mode_bar.pack(fill="x", pady=(0, 12))
         mode_bar.columnconfigure(0, weight=1)
         mode_bar.columnconfigure(1, weight=1)
+        mode_bar.columnconfigure(2, weight=1)
 
         self.btn_mode_direct = tk.Button(
             mode_bar,
             text="✍️ Nhập chủ đề",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 9, "bold"),
             bg=self.c_card,
             fg="#ffffff",
             activebackground=self.c_card,
@@ -265,8 +335,8 @@ class UniPodcastDesktopApp(tk.Tk):
 
         self.btn_mode_hot = tk.Button(
             mode_bar,
-            text="🔥 Tìm chủ đề Hot (AI)",
-            font=("Segoe UI", 10, "bold"),
+            text="🔥 Chủ đề Hot",
+            font=("Segoe UI", 9, "bold"),
             bg=self.c_input,
             fg=self.c_muted,
             activebackground=self.c_card,
@@ -276,7 +346,22 @@ class UniPodcastDesktopApp(tk.Tk):
             cursor="hand2",
             command=lambda: self._switch_mode("hot"),
         )
-        self.btn_mode_hot.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        self.btn_mode_hot.grid(row=0, column=1, sticky="ew", padx=2)
+
+        self.btn_mode_dialogue = tk.Button(
+            mode_bar,
+            text="💬 Hội thoại",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.c_input,
+            fg=self.c_muted,
+            activebackground=self.c_card,
+            activeforeground="#ffffff",
+            bd=0,
+            pady=7,
+            cursor="hand2",
+            command=lambda: self._switch_mode("dialogue"),
+        )
+        self.btn_mode_dialogue.grid(row=0, column=2, sticky="ew", padx=(2, 0))
 
         self.mode_container = tk.Frame(left, bg=self.c_panel)
         self.mode_container.pack(fill="x")
@@ -301,16 +386,16 @@ class UniPodcastDesktopApp(tk.Tk):
             highlightcolor=self.c_accent,
         )
         self.txt_topic.pack(fill="x", pady=(4, 6))
-        self.txt_topic.insert("1.0", "THÍCH THẦM")
+        self.txt_topic.insert("1.0", "CHỈ LÀ LỐP DỰ PHÒNG")
 
         # Quick sample chips
         chips_bar = tk.Frame(self.frame_direct, bg=self.c_panel)
         chips_bar.pack(fill="x", pady=(0, 10))
-        tk.Label(chips_bar, text="Gợi ý nhanh:", font=("Segoe UI", 8), bg=self.c_panel, fg=self.c_muted).pack(side="left", padx=(0, 6))
+        tk.Label(chips_bar, text="Gợi ý Gen Z:", font=("Segoe UI", 8), bg=self.c_panel, fg=self.c_muted).pack(side="left", padx=(0, 6))
         for label_txt, sample_t, sample_d in [
-            ("Thích thầm", "THÍCH THẦM", ""),
-            ("Bạn mượn tiền", "BẠN THÂN MƯỢN TIỀN KHÔNG TRẢ", "Cho bạn thân vay tiền lúc khó khăn nhưng bạn khất lần 3 tháng dù ngày nào cũng đi cà phê sang chảnh."),
-            ("Bạn cùng phòng", "CÔNG CHÚA PHÒNG TRỌ", "Bạn cùng phòng ở bẩn nhưng ra đường luôn ăn mặc lộng lẫy."),
+            ("🛞 Lốp dự phòng", "CHỈ LÀ LỐP DỰ PHÒNG", "Suốt 6 tháng ngày nào cũng nhắn tin ngọt ngào lúc 2h sáng nhưng khi hỏi danh phận thì chối, đến hôm nay phát hiện mình chỉ là lốp dự phòng."),
+            ("🍵 Trà xanh cắm sừng", "BỊ TRÀ XANH CẮM SỪNG", "Cô bạn thân luôn miệng khuyên chia tay người yêu nhưng lại âm thầm nhắn tin thả thính và cắm sừng ngay sau lưng."),
+            ("💅 Đụng độ BB3", "ĐỤNG ĐỘ BB3", "Người yêu báo bận tăng ca nhưng lại bị bắt quả tang đang đi ăn tối lãng mạn cùng bé ba (BB3)."),
         ]:
             b = tk.Button(
                 chips_bar,
@@ -372,7 +457,56 @@ class UniPodcastDesktopApp(tk.Tk):
         self.hot_list_frame = tk.Frame(self.frame_hot, bg=self.c_panel)
         self.hot_list_frame.pack(fill="x", pady=(0, 4))
 
-        # --- Shared Core Settings (4 Clean Dropdowns) ---
+        # --- Dialogue Tab Frame (Độc thoại / Đối thoại & Cặp giọng) ---
+        self.frame_dialogue = tk.Frame(self.mode_container, bg=self.c_panel)
+        self._label(self.frame_dialogue, "Chế độ kể chuyện (Độc thoại / Đối thoại):").pack(anchor="w", pady=(0, 3))
+        self.cb_pmode = ttk.Combobox(
+            self.frame_dialogue,
+            values=[x[0] for x in PODCAST_MODES],
+            state="readonly",
+            font=("Segoe UI", 9),
+        )
+        self.cb_pmode.current(0)
+        self.cb_pmode.pack(fill="x", pady=(0, 8))
+        self.cb_pmode.bind("<<ComboboxSelected>>", lambda _e: self._on_dialogue_cfg_change())
+
+        self.box_pair_cfg = tk.Frame(self.frame_dialogue, bg=self.c_panel)
+        self.box_pair_cfg.pack(fill="x")
+        self._label(self.box_pair_cfg, "Loại cặp dòng (3 loại: Nam–Nữ, Nam–Nam, Nữ–Nữ):").pack(anchor="w", pady=(0, 3))
+        self.cb_pair_type = ttk.Combobox(
+            self.box_pair_cfg,
+            values=[x[0] for x in PAIR_TYPES],
+            state="readonly",
+            font=("Segoe UI", 9),
+        )
+        self.cb_pair_type.current(0)
+        self.cb_pair_type.pack(fill="x", pady=(0, 8))
+        self.cb_pair_type.bind("<<ComboboxSelected>>", lambda _e: self._on_pair_type_change())
+
+        self._label(self.box_pair_cfg, "Chọn 1 cặp giọng đọc (Gồm sẵn 2 giọng):").pack(anchor="w", pady=(0, 3))
+        self.cb_voice_pair = ttk.Combobox(
+            self.box_pair_cfg,
+            values=[x[0] for x in VOICE_PAIRS_BY_TYPE["male_female"]],
+            state="readonly",
+            font=("Segoe UI", 9),
+        )
+        self.cb_voice_pair.current(0)
+        self.cb_voice_pair.pack(fill="x", pady=(0, 6))
+        self.cb_voice_pair.bind("<<ComboboxSelected>>", lambda _e: self._on_dialogue_cfg_change())
+
+        self.box_mono_cfg = tk.Frame(self.frame_dialogue, bg=self.c_panel)
+        self._label(self.box_mono_cfg, "Chọn giọng đọc Độc thoại (1 người):").pack(anchor="w", pady=(0, 3))
+        self.cb_voice_mono = ttk.Combobox(
+            self.box_mono_cfg,
+            values=[x[0] for x in MONO_VOICES],
+            state="readonly",
+            font=("Segoe UI", 9),
+        )
+        self.cb_voice_mono.current(0)
+        self.cb_voice_mono.pack(fill="x", pady=(0, 6))
+        self.cb_voice_mono.bind("<<ComboboxSelected>>", lambda _e: self._on_dialogue_cfg_change())
+
+        # --- Shared Core Settings ---
         tk.Frame(left, bg="#262b38", height=1).pack(fill="x", pady=8)
 
         grid4 = tk.Frame(left, bg=self.c_panel)
@@ -380,7 +514,7 @@ class UniPodcastDesktopApp(tk.Tk):
         grid4.columnconfigure(0, weight=1)
         grid4.columnconfigure(1, weight=1)
 
-        # Row 1: Level + Duration
+        # Row 1: Level + Duration (2 loại: 8-10 và 18-25)
         f_lvl = tk.Frame(grid4, bg=self.c_panel)
         f_lvl.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=4)
         self._label(f_lvl, "Trình độ (Level):").pack(anchor="w", pady=(0, 3))
@@ -390,25 +524,25 @@ class UniPodcastDesktopApp(tk.Tk):
 
         f_dur = tk.Frame(grid4, bg=self.c_panel)
         f_dur.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=4)
-        self._label(f_dur, "Thời lượng:").pack(anchor="w", pady=(0, 3))
+        self._label(f_dur, "Thời lượng (2 loại):").pack(anchor="w", pady=(0, 3))
         self.cb_duration = ttk.Combobox(f_dur, values=[x[0] for x in DURATIONS], state="readonly", font=("Segoe UI", 9))
         self.cb_duration.current(0)
         self.cb_duration.pack(fill="x")
 
-        # Row 2: Female Voice + Male Voice
-        f_vf = tk.Frame(grid4, bg=self.c_panel)
-        f_vf.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=6)
-        self._label(f_vf, "Giọng Nữ (Anna):").pack(anchor="w", pady=(0, 3))
-        self.cb_voice_f = ttk.Combobox(f_vf, values=[x[0] for x in FEMALE_VOICES], state="readonly", font=("Segoe UI", 9))
-        self.cb_voice_f.current(0)
-        self.cb_voice_f.pack(fill="x")
-
-        f_vm = tk.Frame(grid4, bg=self.c_panel)
-        f_vm.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=6)
-        self._label(f_vm, "Giọng Nam (Tom):").pack(anchor="w", pady=(0, 3))
-        self.cb_voice_m = ttk.Combobox(f_vm, values=[x[0] for x in MALE_VOICES], state="readonly", font=("Segoe UI", 9))
-        self.cb_voice_m.current(0)
-        self.cb_voice_m.pack(fill="x")
+        self.btn_dlg_summary = tk.Button(
+            left,
+            text="💬 Hội thoại: Đối thoại (Nam – Nữ) • Aoede & Puck  [Đổi ➔]",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.c_input,
+            fg="#38bdf8",
+            activebackground=self.c_card,
+            activeforeground="#ffffff",
+            bd=0,
+            pady=7,
+            cursor="hand2",
+            command=lambda: self._switch_mode("dialogue"),
+        )
+        self.btn_dlg_summary.pack(fill="x", pady=(6, 2))
 
         # Collapsible Advanced Options
         self.btn_toggle_adv = tk.Button(
@@ -430,21 +564,13 @@ class UniPodcastDesktopApp(tk.Tk):
         adv_grid = tk.Frame(self.frame_adv, bg=self.c_input)
         adv_grid.pack(fill="x")
         adv_grid.columnconfigure(0, weight=1)
-        adv_grid.columnconfigure(1, weight=1)
 
         f_sens = tk.Frame(adv_grid, bg=self.c_input)
-        f_sens.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        f_sens.grid(row=0, column=0, sticky="ew")
         tk.Label(f_sens, text="Mức độ nội dung:", font=("Segoe UI", 8, "bold"), bg=self.c_input, fg="#cbd5e1").pack(anchor="w", pady=(0, 2))
         self.cb_sens = ttk.Combobox(f_sens, values=[x[0] for x in SENSITIVITIES], state="readonly", font=("Segoe UI", 8))
         self.cb_sens.current(0)
         self.cb_sens.pack(fill="x")
-
-        f_pmode = tk.Frame(adv_grid, bg=self.c_input)
-        f_pmode.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        tk.Label(f_pmode, text="Số người đọc:", font=("Segoe UI", 8, "bold"), bg=self.c_input, fg="#cbd5e1").pack(anchor="w", pady=(0, 2))
-        self.cb_pmode = ttk.Combobox(f_pmode, values=[x[0] for x in PODCAST_MODES], state="readonly", font=("Segoe UI", 8))
-        self.cb_pmode.current(0)
-        self.cb_pmode.pack(fill="x")
 
         tk.Label(
             self.frame_adv,
@@ -643,20 +769,61 @@ class UniPodcastDesktopApp(tk.Tk):
 
     def _switch_mode(self, mode: str):
         self.current_mode = mode
+        self.btn_mode_direct.configure(bg=self.c_card if mode == "direct" else self.c_input, fg="#ffffff" if mode == "direct" else self.c_muted)
+        self.btn_mode_hot.configure(bg=self.c_card if mode == "hot" else self.c_input, fg="#ffffff" if mode == "hot" else self.c_muted)
+        self.btn_mode_dialogue.configure(bg=self.c_card if mode == "dialogue" else self.c_input, fg="#ffffff" if mode == "dialogue" else self.c_muted)
+
+        self.frame_direct.pack_forget()
+        self.frame_hot.pack_forget()
+        self.frame_dialogue.pack_forget()
+
         if mode == "direct":
-            self.btn_mode_direct.configure(bg=self.c_card, fg="#ffffff")
-            self.btn_mode_hot.configure(bg=self.c_input, fg=self.c_muted)
-            self.frame_hot.pack_forget()
             self.frame_direct.pack(fill="x")
             self.btn_create.configure(text="🚀 TẠO VIDEO NGAY")
+        elif mode == "dialogue":
+            self.frame_dialogue.pack(fill="x")
+            self.btn_create.configure(text="🚀 TẠO VIDEO NGAY")
         else:
-            self.btn_mode_hot.configure(bg=self.c_card, fg="#ffffff")
-            self.btn_mode_direct.configure(bg=self.c_input, fg=self.c_muted)
-            self.frame_direct.pack_forget()
             self.frame_hot.pack(fill="x")
             self.btn_create.configure(text="🔍 QUÉT 5 CHỦ ĐỀ ĐANG HOT TRÊN MẠNG")
             if not self.hot_candidates and not self.is_scanning_hot:
                 self._scan_hot_topics()
+
+    def _on_pair_type_change(self):
+        ptype = PAIR_TYPES[self.cb_pair_type.current()][1]
+        pairs = VOICE_PAIRS_BY_TYPE.get(ptype, VOICE_PAIRS_BY_TYPE["male_female"])
+        self.cb_voice_pair.configure(values=[x[0] for x in pairs])
+        self.cb_voice_pair.current(0)
+        self._on_dialogue_cfg_change()
+
+    def _get_selected_voice_cfg(self):
+        pmode = PODCAST_MODES[self.cb_pmode.current()][1]
+        ptype = PAIR_TYPES[self.cb_pair_type.current()][1]
+        if pmode == "monologue":
+            mv = MONO_VOICES[self.cb_voice_mono.current()][1]
+            return pmode, ptype, mv, mv
+        pairs = VOICE_PAIRS_BY_TYPE.get(ptype, VOICE_PAIRS_BY_TYPE["male_female"])
+        idx = max(0, min(self.cb_voice_pair.current(), len(pairs) - 1))
+        raw_pair = pairs[idx][1]
+        parts = raw_pair.split("|")
+        v1 = parts[0] if parts else "gemini:Aoede"
+        v2 = parts[1] if len(parts) > 1 else v1
+        return pmode, ptype, v1, v2
+
+    def _on_dialogue_cfg_change(self):
+        pmode, ptype, v1, v2 = self._get_selected_voice_cfg()
+        if pmode == "monologue":
+            self.box_pair_cfg.pack_forget()
+            self.box_mono_cfg.pack(fill="x")
+            v_lbl = v1.replace("gemini:", "")
+            self.btn_dlg_summary.configure(text=f"💬 Hội thoại: Độc thoại (1 người) • Giọng {v_lbl}  [Đổi ➔]")
+        else:
+            self.box_mono_cfg.pack_forget()
+            self.box_pair_cfg.pack(fill="x")
+            t_lbl = "Nam – Nam" if ptype == "male_male" else ("Nữ – Nữ" if ptype == "female_female" else "Nam – Nữ")
+            self.btn_dlg_summary.configure(
+                text=f"💬 Hội thoại: Đối thoại ({t_lbl}) • {v1.replace('gemini:', '')} & {v2.replace('gemini:', '')}  [Đổi ➔]"
+            )
 
     def _toggle_advanced(self):
         self.adv_visible = not self.adv_visible
@@ -819,10 +986,8 @@ class UniPodcastDesktopApp(tk.Tk):
 
         level = LEVELS[self.cb_level.current()][1]
         target_sentences = DURATIONS[self.cb_duration.current()][1]
-        voice_f = FEMALE_VOICES[self.cb_voice_f.current()][1]
-        voice_m = MALE_VOICES[self.cb_voice_m.current()][1]
+        pmode, pair_type, voice_f, voice_m = self._get_selected_voice_cfg()
         sens = SENSITIVITIES[self.cb_sens.current()][1]
-        pmode = PODCAST_MODES[self.cb_pmode.current()][1]
         custom_script = self.txt_custom_script.get("1.0", "end").strip()
 
         self.btn_create.configure(state="disabled", text="⏳ ĐANG KHỞI TẠO VIDEO...")
@@ -832,7 +997,7 @@ class UniPodcastDesktopApp(tk.Tk):
             try:
                 lines = [l.strip() for l in topic_raw.splitlines() if l.strip()]
                 new_id = None
-                if len(lines) == 1 and desc and not custom_script and "|" not in lines[0]:
+                if len(lines) == 1 and not custom_script and "|" not in lines[0]:
                     res = api_request(
                         "/api/mode-ab/create",
                         method="POST",
@@ -842,11 +1007,13 @@ class UniPodcastDesktopApp(tk.Tk):
                             "description": desc,
                             "level": level,
                             "target_sentences": target_sentences,
+                            "podcast_mode": pmode,
+                            "pair_type": pair_type,
                             "cta": "Đăng ký kênh UNI PODCAST và bình luận ý kiến của bạn bên dưới",
                             "sensitivity_mode": sens,
                             "voice": voice_f,
                             "voice_male": voice_m,
-                            "rate": "-12%",
+                            "rate": "+0%",
                             "channel_tag": "UNI PODCAST",
                             "gemini_api_key": DEFAULT_API_KEY,
                         },
@@ -862,6 +1029,7 @@ class UniPodcastDesktopApp(tk.Tk):
                                 "level": parts[1] if len(parts) > 1 else level,
                                 "category": parts[2] if len(parts) > 2 else "TIẾNG ANH THỰC TẾ",
                                 "podcast_mode": pmode,
+                                "pair_type": pair_type,
                                 "sensitivity_mode": sens,
                                 "custom_script": custom_script if i == 0 else "",
                             }
@@ -872,11 +1040,12 @@ class UniPodcastDesktopApp(tk.Tk):
                         payload={
                             "items": items,
                             "podcast_mode": pmode,
+                            "pair_type": pair_type,
                             "subtitle_style": "teleprompter",
                             "sensitivity_mode": sens,
                             "voice": voice_f,
                             "voice_male": voice_m,
-                            "rate": "-12%",
+                            "rate": "+0%",
                             "target_sentences": target_sentences,
                             "channel_tag": "UNI PODCAST",
                             "gemini_api_key": DEFAULT_API_KEY,
@@ -917,8 +1086,16 @@ class UniPodcastDesktopApp(tk.Tk):
                 jobs = api_request("/api/jobs", method="GET")
                 if isinstance(jobs, list):
                     self.after(0, lambda: self._update_jobs_ui(jobs))
+                stats = api_request("/api/system-stats", method="GET")
+                if isinstance(stats, dict) and hasattr(self, "lbl_sys_stats"):
+                    cpu_v = int(round(stats.get("cpu_percent", 0)))
+                    ram_v = int(round(stats.get("ram_percent", 0)))
+                    gpu_v = int(round(stats.get("gpu_percent", 0)))
+                    ram_gb = f" ({stats.get('ram_used_gb', 0)}/{stats.get('ram_total_gb', 0)}GB)" if stats.get("ram_total_gb") else ""
+                    txt = f"CPU: {cpu_v}%   |   RAM: {ram_v}%{ram_gb}   |   GPU: {gpu_v}%"
+                    self.after(0, lambda t=txt: self.lbl_sys_stats.configure(text=t))
             except Exception:
-                pass
+                ensure_backend_running()
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -1008,7 +1185,12 @@ class UniPodcastDesktopApp(tk.Tk):
             return
         fpath = OUTPUT_DIR / j["id"] / fname
         if fpath.exists():
-            os.startfile(str(fpath))
+            if hasattr(os, "startfile"):
+                os.startfile(str(fpath))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(fpath)])
+            else:
+                subprocess.Popen(["xdg-open", str(fpath)])
         else:
             messagebox.showinfo("Không tìm thấy file", f"Không tìm thấy: {fpath}")
 
@@ -1021,7 +1203,12 @@ class UniPodcastDesktopApp(tk.Tk):
         self._open_folder(folder if folder.exists() else OUTPUT_DIR)
 
     def _open_folder(self, path: Path):
-        subprocess.Popen(["explorer.exe", str(path.resolve())])
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer.exe", str(path.resolve())])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path.resolve())])
+        else:
+            subprocess.Popen(["xdg-open", str(path.resolve())])
 
     def _copy_selected_desc(self):
         j = self._get_current_job()
@@ -1090,7 +1277,15 @@ class UniPodcastDesktopApp(tk.Tk):
             messagebox.showerror("Lỗi xoá", str(e))
 
     def _open_web_app_window(self):
-        # Open native frameless Edge/Chrome --app window pointing to 127.0.0.1:8095
+        # Ensure backend is alive before opening web window
+        threading.Thread(target=ensure_backend_running, daemon=True).start()
+        if sys.platform == "darwin":
+            mac_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if os.path.exists(mac_chrome):
+                subprocess.Popen([mac_chrome, f"--app={API_BASE}"])
+                return
+            subprocess.Popen(["open", API_BASE])
+            return
         try:
             subprocess.Popen(["cmd", "/c", "start", "msedge", f"--app={API_BASE}"])
         except Exception:
