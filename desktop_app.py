@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from PIL import Image, ImageTk
 
 from generator import DEFAULT_GEMINI_KEY
 
+logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
 API_BASE = "http://127.0.0.1:8095"
@@ -889,8 +891,10 @@ class UniPodcastDesktopApp(tk.Tk):
                     ),
                 )
             except Exception as e:
-                self.after(0, lambda: self.lbl_status.configure(text=f"Lỗi quét chủ đề: {e}", fg="#f87171"))
-                self.after(0, lambda: messagebox.showerror("Lỗi quét chủ đề", str(e)))
+                logger.exception("Hot topic scan failed")
+                err = str(e)
+                self.after(0, lambda: self.lbl_status.configure(text=f"Lỗi quét chủ đề: {err}", fg="#f87171"))
+                self.after(0, lambda: messagebox.showerror("Lỗi quét chủ đề", err))
             finally:
                 self.is_scanning_hot = False
                 self.after(
@@ -1066,7 +1070,9 @@ class UniPodcastDesktopApp(tk.Tk):
                     ),
                 )
             except Exception as e:
-                self.after(0, lambda: self.lbl_status.configure(text=f"Lỗi: {e}", fg="#f87171"))
+                logger.exception("Job submit failed")
+                err = str(e)
+                self.after(0, lambda: self.lbl_status.configure(text=f"Lỗi: {err}", fg="#f87171"))
             finally:
                 self.after(
                     0,
@@ -1294,6 +1300,7 @@ class UniPodcastDesktopApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app_win = UniPodcastDesktopApp()
     app_win.mainloop()
 

@@ -20,6 +20,16 @@ import httpx
 import imageio_ffmpeg
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
+logger = logging.getLogger(__name__)
+
+_KEY_PARAM_RE = re.compile(r"(key=)[^&\s'\"]+")
+
+
+def safe_err(exc: BaseException) -> str:
+    """Format an exception for logs with API keys in URLs redacted."""
+    return f"{type(exc).__name__}: {_KEY_PARAM_RE.sub(r'\1***', str(exc))}"
+
+
 def _load_default_gemini_key() -> str:
     env_val = os.environ.get("GEMINI_API_KEY", "").strip()
     if env_val:
@@ -1381,8 +1391,8 @@ def make_fallback_anime_bg(seed: int = 0, topic: str = "") -> Image.Image:
         if cand.exists():
             try:
                 return Image.open(cand).convert("RGB")
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.warning("Cannot open fallback bg %s: %s", cand, safe_err(exc))
     return Image.new("RGB", (1024, 1024), (255, 255, 255))
 
 
@@ -1432,8 +1442,8 @@ async def fetch_anime_image(
                         elif r_gem.status_code == 429:
                             _GEMINI_IMG_DISABLED_KEYS.add(active_key)
                             break
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("Gemini image request failed: %s", safe_err(exc))
 
     img = make_fallback_anime_bg(seed, topic=topic or prompt)
     img.save(out_path, "JPEG", quality=95)
@@ -1818,7 +1828,8 @@ Return ONLY a JSON object matching this exact schema (IMPORTANT: "title_vi" MUST
                             raw_json_str = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                             if raw_json_str and "{" in raw_json_str:
                                 break
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("Gemini script model %s failed: %s", model_id, safe_err(exc))
                         continue
             if not raw_json_str:
                 for attempt in range(4):
@@ -1845,7 +1856,8 @@ Return ONLY a JSON object matching this exact schema (IMPORTANT: "title_vi" MUST
                             wait_s = min(20, max(4, int(m.group(1)) + 1)) if m else (6 * (attempt + 1))
                             await asyncio.sleep(wait_s)
                             continue
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("Script fallback API attempt %d failed: %s", attempt + 1, safe_err(exc))
                         await asyncio.sleep(3 * (attempt + 1))
 
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_json_str.strip(), flags=re.MULTILINE)
@@ -1858,7 +1870,8 @@ Return ONLY a JSON object matching this exact schema (IMPORTANT: "title_vi" MUST
         parsed["level"] = level.upper()
         parsed["sensitivity_mode"] = sensitivity_mode
         return parsed
-    except Exception:
+    except Exception as exc:
+        logger.warning("Script generation failed, using fallback script: %s", safe_err(exc))
         return build_fallback_script(topic, level, category, podcast_mode)
 
 
@@ -2524,7 +2537,7 @@ def parse_emotion_and_intensity(raw_emotion: str) -> tuple[str, float]:
             try:
                 pct_val = float(int_part)
                 intensity_scale = max(0.35, min(1.0, 0.30 + 0.70 * (pct_val / 100.0)))
-            except Exception:
+            except ValueError:
                 pass
 
     if raw in EMOTION_ALIAS_MAP:
@@ -3227,7 +3240,8 @@ async def synthesize_batch_gemini_live_ws(
                         if not missing_now:
                             break
                         ch = missing_now
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("Gemini Live chunk failed (will retry): %s", safe_err(exc))
                         continue
                 missing = [entry for entry in ch if entry[0] not in pcm_map]
                 if not missing:
@@ -3290,8 +3304,8 @@ async def synthesize_gemini_tts_rest(
                         cleaned_pcm, _ = smooth_internal_stutters(raw_pcm, SAMPLE_RATE)
                         if len(cleaned_pcm) > 1800:
                             return cleaned_pcm
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Gemini REST TTS failed: %s", safe_err(exc))
     return None
 
 
@@ -3369,7 +3383,8 @@ async def synthesize_line_wav(
                         out_wf.setframerate(SAMPLE_RATE)
                         out_wf.writeframes(all_pcm)
                     return (len(all_pcm) // 2) / float(SAMPLE_RATE)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Single-line Gemini Live synth failed: %s", safe_err(exc))
                 continue
 
         rest_pcm = await synthesize_gemini_tts_rest(gem_voice, clean_tts_text, emo_dir, active_key)
@@ -3733,8 +3748,8 @@ async def build_video_job(
             pause_sec=0.38,
             gemini_api_key=gemini_api_key,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Batch Gemini Live synth failed, per-line fallback will run: %s", safe_err(exc))
 
     sem = asyncio.Semaphore(1)
 

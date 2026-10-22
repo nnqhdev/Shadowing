@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -6,7 +7,9 @@ from typing import Any, Dict, List
 
 import httpx
 
-from generator import DEFAULT_GEMINI_KEY, _load_default_gemini_key
+from generator import DEFAULT_GEMINI_KEY, _load_default_gemini_key, safe_err
+
+logger = logging.getLogger(__name__)
 
 
 def clean_vn_search_query(raw_query: str) -> List[str]:
@@ -104,8 +107,8 @@ async def fetch_live_vn_trend_signals(user_query: str = "") -> List[Dict[str, st
                                     "pubDate": "Web / Báo chí VN gần đây",
                                 }
                             )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("News search source failed: %s", safe_err(exc))
 
         async def _fetch_rss(q: str) -> None:
             try:
@@ -141,8 +144,8 @@ async def fetch_live_vn_trend_signals(user_query: str = "") -> List[Dict[str, st
                                     "pubDate": pub,
                                 }
                             )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("News search source failed: %s", safe_err(exc))
 
         import asyncio
         tasks = [_fetch_rss(q) for q in search_queries[:2]] + [_fetch_ddg(q) for q in search_queries[:1]]
@@ -177,7 +180,8 @@ async def call_llm_json(system_prompt: str, user_prompt: str, gemini_api_key: st
                         raw_json_str = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                         if raw_json_str and "{" in raw_json_str:
                             break
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Gemini screenplay model failed: %s", safe_err(exc))
                     continue
 
         if not raw_json_str:
@@ -204,7 +208,8 @@ async def call_llm_json(system_prompt: str, user_prompt: str, gemini_api_key: st
                         wait_s = min(20, max(4, int(m.group(1)) + 1)) if m else (6 * (attempt + 1))
                         await asyncio.sleep(wait_s)
                         continue
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Screenplay fallback API attempt %d failed: %s", attempt + 1, safe_err(exc))
                     await asyncio.sleep(3 * (attempt + 1))
 
     if not raw_json_str:
@@ -217,7 +222,8 @@ async def call_llm_json(system_prompt: str, user_prompt: str, gemini_api_key: st
         cleaned = cleaned[s_idx : e_idx + 1]
     try:
         return json.loads(cleaned)
-    except Exception:
+    except ValueError as exc:
+        logger.warning("Model returned invalid JSON: %s", exc)
         return {}
 
 

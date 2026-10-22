@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -8,16 +9,17 @@ import time
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from generator import DEFAULT_GEMINI_KEY, build_video_job
+from generator import DEFAULT_GEMINI_KEY, build_video_job, safe_err
 from screenwriter import discover_hot_topics_mode_b, generate_5step_screenplay
 
+logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent.resolve()
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -139,8 +141,9 @@ async def worker_run_jobs(job_ids: List[str], req: BatchRequest) -> None:
                     encoding="utf-8"
                 )
             except Exception as e:
+                logger.exception("Job %s failed", jid)
                 job["status"] = "error"
-                job["message"] = f"Lỗi: {str(e)}"
+                job["message"] = f"Lỗi: {safe_err(e)}"
 
 
 @app.post("/api/batch")
@@ -242,9 +245,11 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
 
     if req.gemini_api_key and req.gemini_api_key.strip():
         try:
-            (BASE_DIR / ".env").write_text(f"GEMINI_API_KEY={req.gemini_api_key.strip()}\n", encoding="utf-8")
-        except Exception:
-            pass
+            env_path = BASE_DIR / ".env"
+            env_path.write_text(f"GEMINI_API_KEY={req.gemini_api_key.strip()}\n", encoding="utf-8")
+            env_path.chmod(0o600)
+        except OSError as exc:
+            logger.warning("Could not persist API key to .env: %s", safe_err(exc))
 
     JOBS[jid] = {
         "id": jid,
@@ -297,8 +302,9 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
                     else "Đã lập kịch bản 5 bước, đang thu âm & dựng Video 3 phần..."
                 )
         except Exception as exc:
+            logger.warning("5-step screenplay failed, using standard script: %s", safe_err(exc))
             if jid in JOBS:
-                JOBS[jid]["message"] = f"Đang khởi tạo kịch bản tiêu chuẩn ({exc})..."
+                JOBS[jid]["message"] = f"Đang khởi tạo kịch bản tiêu chuẩn ({safe_err(exc)})..."
 
         batch_req = BatchRequest(
             items=[
@@ -436,8 +442,8 @@ def _collect_system_stats() -> Dict[str, Any]:
             ram_pct = round(float(vm.percent), 1)
             ram_used_gb = round((vm.total - vm.available) / (1024 ** 3), 1)
             ram_total_gb = round(vm.total / (1024 ** 3), 1)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("RAM stats unavailable: %s", exc)
 
     if os.name == "nt":
         try:
@@ -451,8 +457,8 @@ def _collect_system_stats() -> Dict[str, Any]:
                 gpu_pct = round(float(first_line[0].strip()), 1)
                 if len(first_line) > 1:
                     gpu_mem_mb = round(float(first_line[1].strip()), 0)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("nvidia-smi stats unavailable: %s", exc)
     elif hasattr(os, "uname") and os.uname().sysname == "Darwin":
         try:
             out = subprocess.check_output(
@@ -472,8 +478,8 @@ def _collect_system_stats() -> Dict[str, Any]:
             ]
             if mem_matches:
                 gpu_mem_mb = round(max(mem_matches) / (1024 ** 2), 0)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("macOS GPU stats unavailable: %s", exc)
 
     return {
         "cpu_percent": cpu_pct,
@@ -2033,6 +2039,7 @@ async def index() -> str:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     import uvicorn
 
     port = int(os.environ.get("PORT", "8095"))
