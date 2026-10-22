@@ -9,16 +9,17 @@ import random
 import re
 import shutil
 import subprocess
+import threading
 import time
-import urllib.parse
 import wave
+import weakref
+import zlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-import edge_tts
 import httpx
 import imageio_ffmpeg
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,31 @@ def _load_default_gemini_key() -> str:
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 SAMPLE_RATE = 24000
 DEFAULT_GEMINI_KEY = _load_default_gemini_key()
-IMAGE_SEM = asyncio.Semaphore(2)
-_GEMINI_IMG_DISABLED_KEYS: set[str] = set()
-_USED_IMAGE_URLS: set[str] = set()
+IMAGE_CONCURRENCY = 2
+IMAGE_KEY_COOLDOWN_SEC = 600.0
+
+_IMAGE_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+_image_key_cooldown_until: Dict[str, float] = {}
+
+
+def _image_semaphore() -> asyncio.Semaphore:
+    """One semaphore per running event loop (a module-level Semaphore breaks across loops)."""
+    loop = asyncio.get_running_loop()
+    sem = _IMAGE_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = _IMAGE_SEMAPHORES[loop] = asyncio.Semaphore(IMAGE_CONCURRENCY)
+    return sem
+
+
+def _image_key_available(api_key: str) -> bool:
+    return time.monotonic() >= _image_key_cooldown_until.get(api_key, 0.0)
+
+
+def _cool_down_image_key(api_key: str) -> None:
+    """Pause Gemini image calls for a key that hit its rate limit (429) instead of disabling it forever."""
+    _image_key_cooldown_until[api_key] = time.monotonic() + IMAGE_KEY_COOLDOWN_SEC
 
 
 def get_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
@@ -1002,6 +1025,7 @@ VARIED_SCENE_PROFILES: List[Dict[str, Any]] = [
 ]
 
 _LAST_SCENE_PROFILE_ID: Optional[str] = None
+_SCENE_PROFILE_LOCK = threading.Lock()
 
 
 def select_varied_scene_profile(topic: str, seed: int = 0) -> Dict[str, Any]:
@@ -1021,13 +1045,14 @@ def select_varied_scene_profile(topic: str, seed: int = 0) -> Dict[str, Any]:
         matched = list(VARIED_SCENE_PROFILES)
 
     # Filter out the last used profile so consecutive thumbnails never repeat the same character
-    non_repeating = [p for p in matched if p["id"] != _LAST_SCENE_PROFILE_ID]
-    if not non_repeating:
-        non_repeating = [p for p in VARIED_SCENE_PROFILES if p["id"] != _LAST_SCENE_PROFILE_ID]
-
-    idx = abs(hash((topic or "") + str(seed))) % len(non_repeating)
-    chosen = non_repeating[idx]
-    _LAST_SCENE_PROFILE_ID = chosen["id"]
+    # crc32 (not hash()) so the same topic+seed picks the same profile across processes
+    digest = zlib.crc32(f"{topic or ''}{seed}".encode("utf-8"))
+    with _SCENE_PROFILE_LOCK:
+        non_repeating = [p for p in matched if p["id"] != _LAST_SCENE_PROFILE_ID]
+        if not non_repeating:
+            non_repeating = [p for p in VARIED_SCENE_PROFILES if p["id"] != _LAST_SCENE_PROFILE_ID]
+        chosen = non_repeating[digest % len(non_repeating)]
+        _LAST_SCENE_PROFILE_ID = chosen["id"]
     return chosen
 
 
@@ -1416,9 +1441,9 @@ async def fetch_anime_image(
     )
     active_key = gemini_api_key.strip() or DEFAULT_GEMINI_KEY
 
-    async with IMAGE_SEM:
+    async with _image_semaphore():
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
-            if active_key and active_key not in _GEMINI_IMG_DISABLED_KEYS:
+            if active_key and _image_key_available(active_key):
                 for img_model in ("gemini-2.5-flash-image", "gemini-3.1-flash-lite-image"):
                     try:
                         gem_img_url = f"https://generativelanguage.googleapis.com/v1beta/models/{img_model}:generateContent?key={active_key}"
@@ -1440,7 +1465,7 @@ async def fetch_anime_image(
                                     img.save(out_path, "JPEG", quality=95)
                                     return img
                         elif r_gem.status_code == 429:
-                            _GEMINI_IMG_DISABLED_KEYS.add(active_key)
+                            _cool_down_image_key(active_key)
                             break
                     except Exception as exc:
                         logger.warning("Gemini image request failed: %s", safe_err(exc))

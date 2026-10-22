@@ -131,10 +131,12 @@ def ensure_backend_running() -> None:
         _BACKEND_SERVER_STARTING = True
 
     try:
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        log_file = open(OUTPUT_DIR / "backend.log", "ab")
         popen_kwargs = {
             "cwd": str(BASE_DIR),
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
+            "stdout": log_file,
+            "stderr": subprocess.STDOUT,
         }
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
