@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -8,16 +9,18 @@ import time
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from generator import DEFAULT_GEMINI_KEY, build_video_job
+from generator import DEFAULT_GEMINI_KEY, build_video_job, safe_err
+from studio.storage import ACTIVE_STATUSES, prune_outputs, storage_summary
 from screenwriter import discover_hot_topics_mode_b, generate_5step_screenplay
 
+logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent.resolve()
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -34,21 +37,25 @@ class BatchItem(BaseModel):
     level: str = "B1"
     category: str = "TIẾNG ANH THỰC TẾ"
     podcast_mode: str = "dialogue"
+    pair_type: str = "male_female"
     custom_script: str = ""
     sensitivity_mode: str = "normal"
+    fast_test: bool = False
 
 
 class BatchRequest(BaseModel):
     items: List[BatchItem]
     podcast_mode: str = "dialogue"
+    pair_type: str = "male_female"
     subtitle_style: str = "teleprompter"
     sensitivity_mode: str = "normal"
     voice: str = "gemini:Aoede"
     voice_male: str = "gemini:Puck"
-    rate: str = "-12%"
-    target_sentences: int = 16
+    rate: str = "+0%"
+    target_sentences: int = 10
     channel_tag: str = "UNI PODCAST"
     gemini_api_key: str = DEFAULT_GEMINI_KEY
+    fast_test: bool = False
 
 
 class ModeBDiscoverRequest(BaseModel):
@@ -65,14 +72,17 @@ class ModeABCreateRequest(BaseModel):
     topic: str
     description: str = ""
     level: str = "B1"
-    target_sentences: int = 16
+    target_sentences: int = 10
+    podcast_mode: str = "dialogue"
+    pair_type: str = "male_female"
     cta: str = "Đăng ký kênh, ôn từ vựng & trả lời câu hỏi dưới bình luận"
     sensitivity_mode: str = "normal"
     voice: str = "gemini:Aoede"
     voice_male: str = "gemini:Puck"
-    rate: str = "-12%"
+    rate: str = "+0%"
     channel_tag: str = "UNI PODCAST"
     gemini_api_key: str = DEFAULT_GEMINI_KEY
+    fast_test: bool = False
 
 
 
@@ -100,12 +110,14 @@ async def worker_run_jobs(job_ids: List[str], req: BatchRequest) -> None:
                     JOBS[current_jid]["progress"] = pct
 
             try:
+                is_fast_test = bool(job.get("fast_test", req.fast_test))
                 res = await build_video_job(
                     job_dir=job_dir,
                     topic=job["topic"],
                     level=job["level"],
                     category=job["category"],
                     podcast_mode=job.get("podcast_mode", req.podcast_mode),
+                    pair_type=job.get("pair_type", req.pair_type),
                     voice=req.voice,
                     voice_male=req.voice_male,
                     rate=req.rate,
@@ -115,38 +127,63 @@ async def worker_run_jobs(job_ids: List[str], req: BatchRequest) -> None:
                     custom_script=job.get("custom_script", ""),
                     subtitle_style=req.subtitle_style,
                     sensitivity_mode=job.get("sensitivity_mode", req.sensitivity_mode),
+                    fast_test=is_fast_test,
                     on_progress=on_prog,
                 )
                 job["status"] = "done"
                 job["progress"] = 100
-                job["message"] = "Hoàn tất xuất video Ngang (16:9) & Dọc (9:16)!"
+                job["message"] = (
+                    "Hoàn tất bản Test Nhanh (480p • 1 phần)!"
+                    if is_fast_test
+                    else "Hoàn tất xuất video Ngang (16:9) & Dọc (9:16)!"
+                )
                 job["result"] = res
                 job["description_text"] = (job_dir / "youtube_description.txt").read_text(
                     encoding="utf-8"
                 )
             except Exception as e:
+                logger.exception("Job %s failed", jid)
                 job["status"] = "error"
-                job["message"] = f"Lỗi: {str(e)}"
+                job["message"] = f"Lỗi: {safe_err(e)}"
 
 
 @app.post("/api/batch")
 async def create_batch(req: BatchRequest) -> Dict[str, Any]:
     created_ids: List[str] = []
+    now_ts = time.time()
     for item in req.items:
         if not item.topic.strip():
             continue
+        item_slug = slugify(item.topic)
+        item_lvl = item.level.strip().upper() or "B1"
+        dup_id = next(
+            (
+                j["id"]
+                for j in JOBS.values()
+                if j.get("status") in ("queued", "running")
+                and slugify(j.get("topic", "")) == item_slug
+                and j.get("level", "").upper() == item_lvl
+                and (now_ts - float(j.get("sort_ts", 0))) < 5.0
+            ),
+            None,
+        )
+        if dup_id:
+            continue
         ts = time.strftime("%H%M%S")
         mode_val = item.podcast_mode or req.podcast_mode
+        pair_val = item.pair_type or req.pair_type or "male_female"
         sens_val = item.sensitivity_mode or req.sensitivity_mode or "normal"
-        jid = f"{ts}_{item.level.upper()}_{slugify(item.topic)}_{uuid.uuid4().hex[:4]}"
+        jid = f"{ts}_{item.level.upper()}_{item_slug}_{uuid.uuid4().hex[:4]}"
         JOBS[jid] = {
             "id": jid,
             "topic": item.topic.strip(),
             "level": item.level.strip().upper(),
             "category": item.category.strip().upper(),
             "podcast_mode": mode_val,
+            "pair_type": pair_val,
             "sensitivity_mode": sens_val,
             "custom_script": item.custom_script,
+            "fast_test": bool(item.fast_test or req.fast_test),
             "status": "queued",
             "progress": 0,
             "message": "Đang chờ trong hàng đợi...",
@@ -177,25 +214,58 @@ async def api_mode_b_discover(req: ModeBDiscoverRequest) -> Dict[str, Any]:
 @app.post("/api/mode-ab/create")
 async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
     raw_title = (req.topic or "CHỦ ĐỀ HOT").strip().upper()
-    ts = time.strftime("%H%M%S")
+    title_slug = slugify(raw_title)
     lvl = req.level.strip().upper() or "B1"
-    jid = f"{ts}_{lvl}_{slugify(raw_title)}_{uuid.uuid4().hex[:4]}"
+    now_ts = time.time()
+    existing_jid = next(
+        (
+            j["id"]
+            for j in JOBS.values()
+            if j.get("status") in ("queued", "running")
+            and slugify(j.get("topic", "")) == title_slug
+            and j.get("level", "").upper() == lvl
+            and (now_ts - float(j.get("sort_ts", 0))) < 5.0
+        ),
+        None,
+    )
+    if existing_jid:
+        return {"created_id": existing_jid, "deduplicated": True}
+
+    ts = time.strftime("%H%M%S")
+    jid = f"{ts}_{lvl}_{title_slug}_{uuid.uuid4().hex[:4]}"
 
     job_dir = OUTPUT_DIR / jid
     job_dir.mkdir(parents=True, exist_ok=True)
+
+    pmode = (req.podcast_mode or "dialogue").strip().lower()
+    if pmode not in ("dialogue", "monologue"):
+        pmode = "dialogue"
+    ptype = (req.pair_type or "male_female").strip().lower()
+    if ptype not in ("male_female", "male_male", "female_female"):
+        ptype = "male_female"
+
+    if req.gemini_api_key and req.gemini_api_key.strip():
+        try:
+            env_path = BASE_DIR / ".env"
+            env_path.write_text(f"GEMINI_API_KEY={req.gemini_api_key.strip()}\n", encoding="utf-8")
+            env_path.chmod(0o600)
+        except OSError as exc:
+            logger.warning("Could not persist API key to .env: %s", safe_err(exc))
 
     JOBS[jid] = {
         "id": jid,
         "topic": raw_title,
         "level": lvl,
-        "category": f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
-        "podcast_mode": "dialogue",
+        "category": "⚡ TEST NHANH (480P)" if req.fast_test else f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
+        "podcast_mode": pmode,
+        "pair_type": ptype,
         "sensitivity_mode": req.sensitivity_mode,
         "custom_script": "",
+        "fast_test": bool(req.fast_test),
         "dossier": {},
         "status": "running",
         "progress": 4,
-        "message": f"Đang lập kịch bản 5 bước từ chủ đề '{raw_title}'...",
+        "message": f"Đang lập kịch bản 5 bước ({lvl}, {req.target_sentences} câu) từ chủ đề '{raw_title}'...",
         "created_at": time.strftime("%H:%M:%S"),
         "sort_ts": time.time(),
         "result": None,
@@ -214,6 +284,8 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
                 cta=req.cta,
                 gemini_api_key=req.gemini_api_key or DEFAULT_GEMINI_KEY,
                 sensitivity_mode=req.sensitivity_mode,
+                podcast_mode=pmode,
+                pair_type=ptype,
             )
             custom_script_str = dossier.get("step4_formatted", {}).get("custom_script_for_video", "")
             short_title = (dossier.get("title_vi") or raw_title).strip().upper()
@@ -225,23 +297,31 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
                 JOBS[jid]["custom_script"] = custom_script_str
                 JOBS[jid]["dossier"] = dossier
                 JOBS[jid]["progress"] = 8
-                JOBS[jid]["message"] = "Đã lập kịch bản 5 bước, đang thu âm & dựng Video 3 phần..."
+                JOBS[jid]["message"] = (
+                    "Đã lập kịch bản, đang thu âm & xuất bản Test Nhanh 480p..."
+                    if req.fast_test
+                    else "Đã lập kịch bản 5 bước, đang thu âm & dựng Video 3 phần..."
+                )
         except Exception as exc:
+            logger.warning("5-step screenplay failed, using standard script: %s", safe_err(exc))
             if jid in JOBS:
-                JOBS[jid]["message"] = f"Đang khởi tạo kịch bản tiêu chuẩn ({exc})..."
+                JOBS[jid]["message"] = f"Đang khởi tạo kịch bản tiêu chuẩn ({safe_err(exc)})..."
 
         batch_req = BatchRequest(
             items=[
                 BatchItem(
                     topic=short_title,
                     level=lvl,
-                    category=f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
-                    podcast_mode="dialogue",
+                    category="⚡ TEST NHANH (480P)" if req.fast_test else f"CHẾ ĐỘ {req.mode.upper()} • BIÊN KỊCH 5 BƯỚC",
+                    podcast_mode=pmode,
+                    pair_type=ptype,
                     custom_script=custom_script_str,
                     sensitivity_mode=req.sensitivity_mode,
+                    fast_test=bool(req.fast_test),
                 )
             ],
-            podcast_mode="dialogue",
+            podcast_mode=pmode,
+            pair_type=ptype,
             subtitle_style="teleprompter",
             sensitivity_mode=req.sensitivity_mode,
             voice=req.voice,
@@ -250,6 +330,7 @@ async def api_mode_ab_create(req: ModeABCreateRequest) -> Dict[str, Any]:
             target_sentences=req.target_sentences,
             channel_tag=req.channel_tag,
             gemini_api_key=req.gemini_api_key or DEFAULT_GEMINI_KEY,
+            fast_test=bool(req.fast_test),
         )
         await worker_run_jobs([jid], batch_req)
 
@@ -326,999 +407,136 @@ async def delete_job(job_id: str) -> Dict[str, str]:
     return {"status": "deleted"}
 
 
+class CleanupRequest(BaseModel):
+    keep: int = 10
+    dry_run: bool = False
+
+
+@app.get("/api/storage")
+async def api_storage() -> Dict[str, Any]:
+    return await asyncio.to_thread(storage_summary, OUTPUT_DIR)
+
+
+@app.post("/api/storage/cleanup")
+async def api_storage_cleanup(req: CleanupRequest) -> Dict[str, Any]:
+    """Delete all but the newest `keep` job folders; jobs still queued/running are never touched."""
+    active = {jid for jid, j in JOBS.items() if j.get("status") in ACTIVE_STATUSES}
+    result = await asyncio.to_thread(
+        prune_outputs, OUTPUT_DIR, max(0, req.keep), active, req.dry_run
+    )
+    if not req.dry_run:
+        for name in result["removed"]:
+            JOBS.pop(name, None)
+    return result
+
+
 @app.post("/api/open-folder/{job_id}")
 async def open_folder(job_id: str) -> Dict[str, str]:
     target = (OUTPUT_DIR / job_id).resolve()
     if not target.exists():
         target = OUTPUT_DIR
-    subprocess.Popen(["explorer.exe", str(target)])
+    if os.name == "nt":
+        subprocess.Popen(["explorer.exe", str(target)])
+    elif os.uname().sysname == "Darwin":
+        subprocess.Popen(["open", str(target)])
+    else:
+        subprocess.Popen(["xdg-open", str(target)])
     return {"status": "opened"}
 
 
-INDEX_HTML = r"""<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>UNI Podcast Studio</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #0f1117;
-    --panel: #161922;
-    --panel-alt: #1c202c;
-    --input-bg: #10131a;
-    --border: rgba(255, 255, 255, 0.08);
-    --border-focus: #38bdf8;
-    --text: #f1f5f9;
-    --muted: #94a3b8;
-    --accent: #0ea5e9;
-    --accent-hover: #0284c7;
-    --amber: #f59e0b;
-    --emerald: #10b981;
-    --danger: #ef4444;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: 'Be Vietnam Pro', system-ui, -apple-system, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    padding: 20px 28px;
-    line-height: 1.5;
-  }
+try:
+    import psutil as _psutil
+    _psutil.cpu_percent(interval=None)
+except Exception:
+    _psutil = None
 
-  /* Header */
-  .topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding-bottom: 16px;
-    margin-bottom: 22px;
-    border-bottom: 1px solid var(--border);
-  }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-  .brand-badge {
-    width: 40px;
-    height: 40px;
-    border-radius: 10px;
-    background: linear-gradient(135deg, #0ea5e9, #2563eb);
-    display: grid;
-    place-items: center;
-    font-size: 20px;
-  }
-  .brand h1 {
-    font-size: 18px;
-    font-weight: 800;
-    letter-spacing: -0.01em;
-  }
-  .brand p {
-    font-size: 12.5px;
-    color: var(--muted);
-  }
 
-  /* Layout */
-  .workspace {
-    display: grid;
-    grid-template-columns: 400px 1fr;
-    gap: 24px;
-    align-items: start;
-  }
-  @media (max-width: 1024px) {
-    .workspace { grid-template-columns: 1fr; }
-  }
+def _collect_system_stats() -> Dict[str, Any]:
+    cpu_pct = 0.0
+    ram_pct = 0.0
+    ram_used_gb = 0.0
+    ram_total_gb = 0.0
+    gpu_pct = 0.0
+    gpu_mem_mb = 0.0
 
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 20px;
-  }
-  .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 16px;
-  }
-  .panel-title {
-    font-size: 15px;
-    font-weight: 700;
-  }
+    if _psutil is not None:
+        try:
+            cpu_pct = round(float(_psutil.cpu_percent(interval=None)), 1)
+            vm = _psutil.virtual_memory()
+            ram_pct = round(float(vm.percent), 1)
+            ram_used_gb = round((vm.total - vm.available) / (1024 ** 3), 1)
+            ram_total_gb = round(vm.total / (1024 ** 3), 1)
+        except Exception as exc:
+            logger.debug("RAM stats unavailable: %s", exc)
 
-  /* Mode Switcher */
-  .mode-switch {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-    background: var(--input-bg);
-    padding: 5px;
-    border-radius: 11px;
-    border: 1px solid var(--border);
-    margin-bottom: 16px;
-  }
-  .mode-btn {
-    background: transparent;
-    color: var(--muted);
-    border: none;
-    padding: 9px 10px;
-    border-radius: 8px;
-    font-family: inherit;
-    font-size: 13px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-  .mode-btn:hover { color: var(--text); }
-  .mode-btn.active {
-    background: var(--panel-alt);
-    color: #fff;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.25);
-  }
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                timeout=0.8,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="ignore").strip()
+            if out:
+                first_line = out.splitlines()[0].split(",")
+                gpu_pct = round(float(first_line[0].strip()), 1)
+                if len(first_line) > 1:
+                    gpu_mem_mb = round(float(first_line[1].strip()), 0)
+        except Exception as exc:
+            logger.debug("nvidia-smi stats unavailable: %s", exc)
+    elif hasattr(os, "uname") and os.uname().sysname == "Darwin":
+        try:
+            out = subprocess.check_output(
+                ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+                timeout=0.8,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="ignore")
+            utils = [
+                int(m.group(1))
+                for m in re.finditer(r'"(?:Device|Renderer|Tiler|Device Unit \d+) Utilization %"\s*=\s*(\d+)', out)
+            ]
+            if utils:
+                gpu_pct = float(max(utils))
+            # ioreg reports a negative counter as an unsigned 64-bit wrap-around (~1.8e19); drop those
+            mem_matches = [
+                v
+                for v in (
+                    int(m.group(1))
+                    for m in re.finditer(r'"inUse(?:Sys|Vid)MemoryBytes"\s*=\s*(\d+)', out)
+                )
+                if v < (1 << 48)
+            ]
+            if mem_matches:
+                gpu_mem_mb = round(max(mem_matches) / (1024 ** 2), 0)
+        except Exception as exc:
+            logger.debug("macOS GPU stats unavailable: %s", exc)
 
-  /* Form Controls */
-  .field { margin-bottom: 14px; }
-  .field-label {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 12.5px;
-    font-weight: 600;
-    color: #cbd5e1;
-    margin-bottom: 6px;
-  }
-  .field-hint {
-    font-size: 11.5px;
-    font-weight: 400;
-    color: var(--muted);
-  }
-  textarea, input, select {
-    width: 100%;
-    background: var(--input-bg);
-    border: 1px solid rgba(255,255,255,0.11);
-    color: var(--text);
-    border-radius: 10px;
-    padding: 10px 12px;
-    font-family: inherit;
-    font-size: 13.5px;
-    transition: border-color 0.15s;
-  }
-  textarea:focus, input:focus, select:focus {
-    outline: none;
-    border-color: var(--border-focus);
-  }
-  .grid-2 {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-  }
-
-  /* Buttons */
-  .primary-btn {
-    width: 100%;
-    padding: 13px 16px;
-    border: none;
-    border-radius: 11px;
-    background: var(--accent);
-    color: #fff;
-    font-family: inherit;
-    font-size: 14.5px;
-    font-weight: 700;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    transition: background 0.15s, transform 0.1s;
-    margin-top: 6px;
-  }
-  .primary-btn:hover { background: var(--accent-hover); }
-  .primary-btn:active { transform: scale(0.99); }
-  .primary-btn:disabled { opacity: 0.55; cursor: not-allowed; }
-
-  .btn {
-    background: var(--panel-alt);
-    border: 1px solid rgba(255,255,255,0.1);
-    color: var(--text);
-    padding: 8px 13px;
-    border-radius: 9px;
-    font-family: inherit;
-    font-size: 12.5px;
-    font-weight: 600;
-    text-decoration: none;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    transition: background 0.15s;
-  }
-  .btn:hover { background: #262c3d; }
-  .btn-primary-soft {
-    background: rgba(14, 165, 233, 0.15);
-    border-color: rgba(14, 165, 233, 0.35);
-    color: #7dd3fc;
-  }
-  .btn-primary-soft:hover { background: rgba(14, 165, 233, 0.25); }
-  .btn-danger-soft {
-    background: transparent;
-    border-color: transparent;
-    color: #94a3b8;
-    padding: 6px 9px;
-  }
-  .btn-danger-soft:hover {
-    background: rgba(239, 68, 68, 0.15);
-    color: #fca5a5;
-  }
-
-  /* Quick Chips */
-  .chips {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    margin-top: 7px;
-  }
-  .chip {
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    color: #cbd5e1;
-    font-family: inherit;
-    font-size: 11.5px;
-    font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 7px;
-    cursor: pointer;
-  }
-  .chip:hover {
-    background: rgba(14, 165, 233, 0.15);
-    border-color: rgba(14, 165, 233, 0.4);
-    color: #fff;
-  }
-  .chip.active {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
-
-  /* Advanced Drawer */
-  details.adv-drawer {
-    margin: 12px 0;
-    background: var(--input-bg);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 9px 12px;
-  }
-  details.adv-drawer summary {
-    cursor: pointer;
-    font-size: 12.5px;
-    font-weight: 600;
-    color: var(--muted);
-    user-select: none;
-  }
-  details.adv-drawer[open] summary {
-    margin-bottom: 12px;
-    color: var(--text);
-  }
-
-  /* Hot Candidates List */
-  .cand-list {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-top: 12px;
-  }
-  .cand-item {
-    background: var(--input-bg);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 11px 12px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-  }
-  .cand-item.best {
-    border-color: rgba(16, 185, 129, 0.45);
-    background: rgba(16, 185, 129, 0.06);
-  }
-  .cand-info h5 {
-    font-size: 13px;
-    font-weight: 700;
-    margin-bottom: 3px;
-  }
-  .cand-info p {
-    font-size: 11.5px;
-    color: var(--muted);
-  }
-
-  /* Video Cards List */
-  .jobs-list {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-  .job-card {
-    background: var(--panel-alt);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 16px;
-  }
-  .job-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin-bottom: 12px;
-  }
-  .job-title-wrap {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .lvl-badge {
-    background: var(--amber);
-    color: #0f1117;
-    font-weight: 800;
-    font-size: 11.5px;
-    padding: 2px 8px;
-    border-radius: 6px;
-  }
-  .job-title {
-    font-size: 15px;
-    font-weight: 700;
-  }
-  .status-pill {
-    font-size: 11.5px;
-    font-weight: 700;
-    padding: 3px 10px;
-    border-radius: 99px;
-  }
-  .status-running { background: rgba(14, 165, 233, 0.18); color: #38bdf8; }
-  .status-done { background: rgba(16, 185, 129, 0.18); color: #34d399; }
-  .status-queued { background: rgba(255, 255, 255, 0.08); color: #94a3b8; }
-  .status-error { background: rgba(239, 68, 68, 0.18); color: #f87171; }
-
-  .progress-track {
-    background: var(--input-bg);
-    height: 8px;
-    border-radius: 99px;
-    overflow: hidden;
-    margin: 8px 0 6px;
-  }
-  .progress-fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--accent), var(--emerald));
-    transition: width 0.3s ease;
-  }
-
-  .media-row {
-    display: grid;
-    grid-template-columns: 260px 1fr;
-    gap: 14px;
-    align-items: start;
-  }
-  @media (max-width: 860px) {
-    .media-row { grid-template-columns: 1fr; }
-  }
-  .thumb-box, .player-box {
-    background: var(--input-bg);
-    border: 1px solid var(--border);
-    border-radius: 11px;
-    padding: 10px;
-  }
-  .box-label {
-    font-size: 11.5px;
-    font-weight: 600;
-    color: var(--muted);
-    margin-bottom: 8px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .thumb-box img {
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    object-fit: cover;
-    border-radius: 7px;
-    display: block;
-  }
-  .player-box video {
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    max-height: 340px;
-    background: #000;
-    border-radius: 7px;
-    display: block;
-  }
-  .card-actions {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px solid var(--border);
-  }
-  .card-actions-left {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-
-  /* Toast Notification */
-  #toast {
-    position: fixed;
-    bottom: 24px;
-    right: 24px;
-    background: #10b981;
-    color: #052e16;
-    font-weight: 700;
-    font-size: 13px;
-    padding: 10px 16px;
-    border-radius: 10px;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.4);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s;
-    z-index: 9999;
-  }
-  #toast.show { opacity: 1; }
-</style>
-</head>
-<body>
-
-<header class="topbar">
-  <div class="brand">
-    <div class="brand-badge">🎧</div>
-    <div>
-      <h1>UNI Podcast Studio</h1>
-      <p>Tạo Video Luyện Nghe Tiếng Anh 3 Phần & Thumbnail Tự Động</p>
-    </div>
-  </div>
-  <button class="btn" onclick="openFolder('')">📂 Mở thư mục chứa tất cả Video</button>
-</header>
-
-<main class="workspace">
-  <!-- CỘT TRÁI: BẢNG TẠO VIDEO GỌN NHẸ -->
-  <section class="panel">
-    <div class="mode-switch">
-      <button type="button" class="mode-btn active" id="btnModeDirect" onclick="setMode('direct')">✍️ Nhập chủ đề</button>
-      <button type="button" class="mode-btn" id="btnModeHot" onclick="setMode('hot')">🔥 Tìm chủ đề Hot</button>
-    </div>
-
-    <!-- CHẾ ĐỘ 1: NHẬP CHỦ ĐỀ TRỰC TIẾP -->
-    <div id="paneDirect">
-      <div class="field">
-        <div class="field-label">
-          <span>Chủ đề bài nghe</span>
-          <span class="field-hint">Nhập 1 hoặc nhiều dòng</span>
-        </div>
-        <textarea id="topicInput" rows="2" placeholder="VD: Bạn thân mượn tiền mãi không trả...">THÍCH THẦM</textarea>
-        <div class="chips">
-          <button type="button" class="chip" onclick="pickSample('THÍCH THẦM', '')">Thích thầm</button>
-          <button type="button" class="chip" onclick="pickSample('BẠN THÂN MƯỢN TIỀN KHÔNG TRẢ', 'Cho bạn vay tiền lúc khó khăn nhưng bạn khất lần 3 tháng dù vẫn đi cà phê sang chảnh.')">Bạn mượn tiền</button>
-          <button type="button" class="chip" onclick="pickSample('CÔNG CHÚA PHÒNG TRỌ', 'Bạn cùng phòng ở bẩn nhưng ra đường luôn ăn mặc lộng lẫy.')">Bạn cùng phòng</button>
-        </div>
-      </div>
-
-      <div class="field">
-        <div class="field-label">
-          <span>Tình huống / Ý tưởng chi tiết</span>
-          <span class="field-hint">Không bắt buộc</span>
-        </div>
-        <textarea id="descInput" rows="2" placeholder="Để trống nếu muốn AI tự nghĩ tình huống, hoặc ghi ngắn gọn ý bạn muốn..."></textarea>
-      </div>
-    </div>
-
-    <!-- CHẾ ĐỘ 2: AI SĂN CHỦ ĐỀ HOT -->
-    <div id="paneHot" style="display:none;">
-      <div class="field">
-        <div class="field-label">
-          <span>Từ khoá vụ việc / Drama đang Hot</span>
-          <span class="field-hint">Nhấn Enter hoặc bấm Quét</span>
-        </div>
-        <input type="text" id="hotQueryInput" placeholder="VD: Ngoại tình công sở, drama bạn thân... (Để trống AI tự quét)" onkeydown="if(event.key==='Enter'){event.preventDefault();scanHotTopics();}" />
-      </div>
-      <button type="button" id="btnScanHot" class="btn btn-primary-soft" style="width:100%;justify-content:center;padding:10px;" onclick="scanHotTopics()">
-        🔍 Quét Mới 5 Chủ Đề Đang Hot Trên Mạng
-      </button>
-      <div id="hotCandidatesList" class="cand-list"></div>
-    </div>
-
-    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
-
-    <!-- CÀI ĐẶT CHUNG GỌN GÀNG (CHỈ 4 Ô CẦN THIẾT) -->
-    <div class="grid-2 field">
-      <div>
-        <div class="field-label"><span>Trình độ (Level)</span></div>
-        <select id="levelSelect">
-          <option value="A1">A1 — Sơ cấp</option>
-          <option value="A2">A2 — Căn bản</option>
-          <option value="B1" selected>B1 — Trung cấp</option>
-          <option value="B2">B2 — Khá giỏi</option>
-          <option value="C1">C1 — Cao cấp</option>
-          <option value="C2">C2 — Bản xứ</option>
-        </select>
-      </div>
-      <div>
-        <div class="field-label"><span>Thời lượng</span></div>
-        <select id="durationSelect">
-          <option value="8" selected>Ngắn (~2 - 3 phút)</option>
-          <option value="18">Vừa (~6 - 8 phút)</option>
-          <option value="32">Dài (~12 - 15 phút)</option>
-          <option value="52">Tập lớn (~20 phút)</option>
-        </select>
-      </div>
-    </div>
-
-    <div class="grid-2 field">
-      <div>
-        <div class="field-label"><span>Giọng Nữ (Anna)</span></div>
-        <select id="voiceFemaleSelect">
-          <option value="gemini:Aoede" selected>Aoede (Truyền cảm)</option>
-          <option value="gemini:Kore">Kore (Trầm ấm)</option>
-          <option value="gemini:Leda">Leda (Trẻ trung)</option>
-          <option value="gemini:Zephyr">Zephyr (Hiện đại)</option>
-          <option value="gemini:Callirrhoe">Callirrhoe (Dịu dàng)</option>
-          <option value="gemini:Despina">Despina (Kịch tính)</option>
-          <option value="gemini:Autonoe">Autonoe (Rõ chữ)</option>
-          <option value="gemini:Achernar">Achernar (Sâu sắc)</option>
-          <option value="gemini:Sulafat">Sulafat (Kể chuyện)</option>
-        </select>
-      </div>
-      <div>
-        <div class="field-label"><span>Giọng Nam (Tom)</span></div>
-        <select id="voiceMaleSelect">
-          <option value="gemini:Puck" selected>Puck (Trẻ trung)</option>
-          <option value="gemini:Fenrir">Fenrir (Trầm điện ảnh)</option>
-          <option value="gemini:Charon">Charon (Điềm đạm)</option>
-          <option value="gemini:Enceladus">Enceladus (Lãng mạn)</option>
-          <option value="gemini:Orus">Orus (Dứt khoát)</option>
-          <option value="gemini:Iapetus">Iapetus (Thân thiện)</option>
-          <option value="gemini:Umbriel">Umbriel (Thư thái)</option>
-          <option value="gemini:Achird">Achird (Năng động)</option>
-          <option value="gemini:Algenib">Algenib (Trầm sâu)</option>
-        </select>
-      </div>
-    </div>
-
-    <!-- TUỲ CHỌN MỞ RỘNG (ẨN GỌN MẶC ĐỊNH) -->
-    <details class="adv-drawer">
-      <summary>⚙️ Tuỳ chọn nâng cao (Phong cách, Kịch bản có sẵn...)</summary>
-      <div class="grid-2 field">
-        <div>
-          <div class="field-label"><span>Mức độ nội dung</span></div>
-          <select id="sensitivitySelect">
-            <option value="normal" selected>🙂 Đời thường tự nhiên</option>
-            <option value="sensitive_ok">🌶️ Drama / Nhạy cảm</option>
-            <option value="polite">😇 Lịch sự / Học đường</option>
-          </select>
-        </div>
-        <div>
-          <div class="field-label"><span>Số người đọc</span></div>
-          <select id="podcastModeSelect">
-            <option value="dialogue" selected>👫 2 Người (Anna & Tom)</option>
-            <option value="monologue">🎙️ 1 Người (Độc thoại)</option>
-          </select>
-        </div>
-      </div>
-      <div class="field" style="margin-bottom:0;">
-        <div class="field-label">
-          <span>Tự dán kịch bản có sẵn</span>
-          <span class="field-hint">Để trống nếu AI tự viết</span>
-        </div>
-        <textarea id="customScriptInput" rows="3" placeholder="Anna: Hello Tom! | Chào Tom!&#10;Tom: Hi Anna! | Chào Anna!"></textarea>
-      </div>
-    </details>
-
-    <button id="createBtn" class="primary-btn" onclick="handleCreateVideo()">
-      🚀 Tạo Video Ngay
-    </button>
-    <div id="createStatusMsg" style="font-size:12px;color:var(--muted);margin-top:8px;text-align:center;"></div>
-  </section>
-
-  <!-- CỘT PHẢI: KHO VIDEO CỦA BẠN -->
-  <section class="panel">
-    <div class="panel-header">
-      <span class="panel-title">🎬 Kho Video Đã Tạo</span>
-      <span id="jobCountBadge" style="font-size:12px;color:var(--muted);"></span>
-    </div>
-    <div id="jobsContainer" class="jobs-list"></div>
-  </section>
-</main>
-
-<div id="toast">Đã sao chép!</div>
-
-<script>
-const DEFAULT_API_KEY = "";
-let currentMode = 'direct';
-let hotCandidates = [];
-let isScanningHot = false;
-
-function showToast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2200);
-}
-
-function setMode(m) {
-  currentMode = m;
-  document.getElementById('btnModeDirect').classList.toggle('active', m === 'direct');
-  document.getElementById('btnModeHot').classList.toggle('active', m === 'hot');
-  document.getElementById('paneDirect').style.display = (m === 'direct') ? 'block' : 'none';
-  document.getElementById('paneHot').style.display = (m === 'hot') ? 'block' : 'none';
-  const createBtn = document.getElementById('createBtn');
-  if (m === 'hot') {
-    createBtn.innerHTML = '🔍 Quét 5 Chủ Đề Đang Hot Trên Mạng';
-    if (hotCandidates.length === 0 && !isScanningHot) {
-      scanHotTopics();
+    return {
+        "cpu_percent": cpu_pct,
+        "ram_percent": ram_pct,
+        "ram_used_gb": ram_used_gb,
+        "ram_total_gb": ram_total_gb,
+        "gpu_percent": gpu_pct,
+        "gpu_mem_mb": gpu_mem_mb,
     }
-  } else {
-    createBtn.innerHTML = '🚀 Tạo Video Ngay';
-  }
-}
 
-function pickSample(topic, desc) {
-  document.getElementById('topicInput').value = topic;
-  document.getElementById('descInput').value = desc || '';
-}
 
-async function handleCreateVideo() {
-  if (currentMode === 'hot') {
-    await scanHotTopics();
-    return;
-  }
-  const topicRaw = document.getElementById('topicInput').value.trim();
-  const desc = document.getElementById('descInput').value.trim();
-  if (!topicRaw) {
-    alert('Vui lòng nhập chủ đề bài nghe!');
-    return;
-  }
+@app.get("/api/system-stats")
+async def api_system_stats() -> Dict[str, Any]:
+    return await asyncio.to_thread(_collect_system_stats)
 
-  const level = document.getElementById('levelSelect').value;
-  const target_sentences = parseInt(document.getElementById('durationSelect').value, 10) || 10;
-  const voice = document.getElementById('voiceFemaleSelect').value;
-  const voice_male = document.getElementById('voiceMaleSelect').value;
-  const sensitivity_mode = document.getElementById('sensitivitySelect').value;
-  const podcast_mode = document.getElementById('podcastModeSelect').value;
-  const custom_script = document.getElementById('customScriptInput').value.trim();
 
-  const btn = document.getElementById('createBtn');
-  const statusEl = document.getElementById('createStatusMsg');
-  btn.disabled = true;
+STATIC_DIR = BASE_DIR / "static"
 
-  try {
-    const lines = topicRaw.split('\n').map(l => l.trim()).filter(Boolean);
-    // Nếu người dùng nhập 1 chủ đề kèm mô tả tình huống (và không dán kịch bản sẵn), dùng quy trình biên kịch sâu Mode A
-    if (lines.length === 1 && desc && !custom_script && !lines[0].includes('|')) {
-      statusEl.textContent = '⏳ Đang khởi tạo kịch bản 5 bước và dựng video...';
-      await fetch('/api/mode-ab/create', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          mode: 'A',
-          topic: lines[0],
-          description: desc,
-          level,
-          target_sentences,
-          cta: 'Đăng ký kênh UNI PODCAST và bình luận ý kiến của bạn bên dưới',
-          sensitivity_mode,
-          voice,
-          voice_male,
-          rate: '-12%',
-          channel_tag: 'UNI PODCAST',
-          gemini_api_key: DEFAULT_API_KEY
-        })
-      });
-    } else {
-      statusEl.textContent = '⏳ Đã đưa vào hàng đợi sản xuất video...';
-      const items = lines.map((line, idx) => {
-        const parts = line.split('|').map(x => x.trim());
-        return {
-          topic: parts[0] || 'CHỦ ĐỀ MỚI',
-          level: parts[1] || level,
-          category: parts[2] || 'TIẾNG ANH THỰC TẾ',
-          podcast_mode,
-          sensitivity_mode,
-          custom_script: idx === 0 ? custom_script : ''
-        };
-      });
-      await fetch('/api/batch', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          items,
-          podcast_mode,
-          subtitle_style: 'teleprompter',
-          sensitivity_mode,
-          voice,
-          voice_male,
-          rate: '-12%',
-          target_sentences,
-          channel_tag: 'UNI PODCAST',
-          gemini_api_key: DEFAULT_API_KEY
-        })
-      });
-    }
-    statusEl.textContent = '';
-    showToast('🚀 Đã bắt đầu dựng video! Xem tiến độ bên phải.');
-    await refreshJobs();
-  } catch (e) {
-    statusEl.textContent = 'Lỗi: ' + e.message;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function scanHotTopics() {
-  if (isScanningHot) return;
-  isScanningHot = true;
-  const topic = document.getElementById('hotQueryInput').value.trim();
-  const level = document.getElementById('levelSelect').value;
-  const sensitivity_mode = document.getElementById('sensitivitySelect').value;
-  const btn = document.getElementById('btnScanHot');
-  const createBtn = document.getElementById('createBtn');
-  const box = document.getElementById('hotCandidatesList');
-
-  btn.disabled = true;
-  btn.textContent = '⏳ AI đang quét xu hướng mạng xã hội...';
-  if (currentMode === 'hot') {
-    createBtn.disabled = true;
-    createBtn.textContent = '⏳ Đang quét 5 chủ đề Hot...';
-  }
-  box.innerHTML = `<div style="font-size:12.5px;color:#38bdf8;padding:10px;background:rgba(14,165,233,0.08);border-radius:8px;text-align:center;">🔍 AI đang săn 5 chủ đề & drama hấp dẫn nhất (khoảng 2-3 giây)...</div>`;
-
-  try {
-    const res = await fetch('/api/mode-b/discover', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        level,
-        topic,
-        description: '',
-        cta: 'Đăng ký kênh UNI PODCAST',
-        sensitivity_mode,
-        gemini_api_key: DEFAULT_API_KEY
-      })
-    });
-    if (!res.ok) {
-      throw new Error('Server trả về lỗi ' + res.status);
-    }
-    const data = await res.json();
-    hotCandidates = data.candidates || [];
-    const bestId = data.best_id || 1;
-
-    if (!hotCandidates.length) {
-      box.innerHTML = `<div style="color:#f87171;font-size:12.5px;padding:8px 0;">Không tìm thấy chủ đề nào, vui lòng thử lại.</div>`;
-    } else {
-      box.innerHTML = hotCandidates.map((c, idx) => {
-        const isBest = (c.id === bestId);
-        return `
-          <div class="cand-item ${isBest ? 'best' : ''}">
-            <div class="cand-info">
-              <h5>${isBest ? '⭐ ' : '🔥 '}${c.topic || ''}</h5>
-              <p>${c.description || ''}</p>
-            </div>
-            <button type="button" class="btn btn-primary-soft" style="flex-shrink:0;" onclick="selectHotCandidate(${idx})">
-              🎬 Chọn & Tạo
-            </button>
-          </div>
-        `;
-      }).join('');
-    }
-  } catch (e) {
-    box.innerHTML = `<div style="color:#f87171;font-size:12.5px;padding:8px 0;">Lỗi khi quét chủ đề: ${e.message}</div>`;
-  } finally {
-    isScanningHot = false;
-    btn.disabled = false;
-    btn.textContent = '🔍 Quét Mới 5 Chủ Đề Đang Hot Trên Mạng';
-    if (currentMode === 'hot') {
-      createBtn.disabled = false;
-      createBtn.innerHTML = '🔍 Quét 5 Chủ Đề Đang Hot Trên Mạng';
-    }
-  }
-}
-
-async function selectHotCandidate(idx) {
-  const c = hotCandidates[idx];
-  if (!c) return;
-  document.getElementById('topicInput').value = c.topic || '';
-  document.getElementById('descInput').value = c.description || '';
-  setMode('direct');
-  await handleCreateVideo();
-}
-
-function mmssToSec(mmss) {
-  if (!mmss || !mmss.includes(':')) return 0;
-  const p = mmss.split(':').map(Number);
-  return p.length === 3 ? p[0]*3600 + p[1]*60 + p[2] : p[0]*60 + p[1];
-}
-
-function seekVideo(vidId, sec) {
-  const v = document.getElementById(vidId);
-  if (v) {
-    v.currentTime = sec;
-    v.play();
-  }
-}
-
-function switchVideoPreview(vidId, srcUrl, isVertical, btnEl) {
-  const v = document.getElementById(vidId);
-  if (!v) return;
-  v.src = srcUrl;
-  v.style.aspectRatio = isVertical ? '9 / 16' : '16 / 9';
-  v.style.maxHeight = isVertical ? '380px' : '340px';
-  v.style.margin = '0 auto';
-  if (btnEl && btnEl.parentElement) {
-    Array.from(btnEl.parentElement.children).forEach(b => b.classList.remove('active'));
-    btnEl.classList.add('active');
-  }
-  v.play();
-}
-
-async function openFolder(jobId) {
-  await fetch(`/api/open-folder/${jobId || '_root'}`, {method: 'POST'});
-}
-
-function copyText(id) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  navigator.clipboard.writeText(el.value);
-  showToast('📋 Đã copy Mô tả YouTube + Chapters!');
-}
-
-async function deleteJob(jobId) {
-  if (!confirm('Bạn có chắc muốn xoá video này?')) return;
-  await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {method: 'DELETE'});
-  const card = document.getElementById(`card_${jobId}`);
-  if (card) card.remove();
-  delete cardStates[jobId];
-}
-
-const cardStates = {};
-function renderJobCardInner(j) {
-  const statusMap = {
-    queued: ['Đang chờ', 'status-queued'],
-    running: [`Đang tạo (${j.progress || 0}%)`, 'status-running'],
-    done: ['Hoàn thành', 'status-done'],
-    error: ['Lỗi', 'status-error']
-  };
-  const [stText, stClass] = statusMap[j.status] || ['...', 'status-queued'];
-
-  let bodyHtml = `
-    <div class="progress-track"><div class="progress-fill" style="width:${j.progress || 0}%"></div></div>
-    <div style="font-size:12.5px;color:var(--muted);">${j.message || ''}</div>
-  `;
-
-  if (j.status === 'done' && j.result) {
-    const r = j.result;
-    const p2Sec = mmssToSec(r.chapters.part2);
-    const p3Sec = mmssToSec(r.chapters.part3);
-    const vidDomId = `vid_${j.id}`;
-    const descDomId = `desc_${j.id}`;
-    const encId = encodeURIComponent(j.id);
-
-    const vVertUrl = r.video_vertical_file ? `/outputs/${encId}/${r.video_vertical_file}` : '';
-    const tkVertUrl = r.tiktok_vertical_file ? `/outputs/${encId}/${r.tiktok_vertical_file}` : '';
-    const tkHorizUrl = r.tiktok_horizontal_file ? `/outputs/${encId}/${r.tiktok_horizontal_file}` : '';
-
-    bodyHtml = `
-      <div class="media-row">
-        <div class="thumb-box">
-          <div class="box-label">
-            <span>Ảnh bìa (Thumbnail)</span>
-            <a href="/outputs/${encId}/${r.thumbnail_file}" download style="color:#38bdf8;text-decoration:none;">Tải ảnh</a>
-          </div>
-          <img src="/outputs/${encId}/${r.thumbnail_file}?t=${j.sort_ts || 1}" alt="Thumbnail" />
-        </div>
-
-        <div class="player-box">
-          <div class="box-label">
-            <div class="chips" style="margin-top:0;">
-              <button class="chip active" onclick="switchVideoPreview('${vidDomId}', '/outputs/${encId}/${r.video_file}?v=${j.sort_ts || 1}', false, this)">🖥️ Ngang 16:9</button>
-              ${vVertUrl ? `<button class="chip" onclick="switchVideoPreview('${vidDomId}', '${vVertUrl}?v=${j.sort_ts || 1}', true, this)">📱 Dọc 9:16</button>` : ''}
-              ${tkVertUrl ? `<button class="chip" onclick="switchVideoPreview('${vidDomId}', '${tkVertUrl}?v=${j.sort_ts || 1}', true, this)">🔥 TikTok Dọc</button>` : ''}
-              ${tkHorizUrl ? `<button class="chip" onclick="switchVideoPreview('${vidDomId}', '${tkHorizUrl}?v=${j.sort_ts || 1}', false, this)">🎬 TikTok Ngang</button>` : ''}
-            </div>
-            <span>${r.sentence_count} câu</span>
-          </div>
-
-          <video id="${vidDomId}" controls preload="metadata" src="/outputs/${encId}/${r.video_file}?v=${j.sort_ts || 1}"></video>
-
-          <div class="chips" style="margin-top:8px;">
-            <button class="chip" onclick="seekVideo('${vidDomId}', 5)">Phần 1: Sub Anh</button>
-            <button class="chip" onclick="seekVideo('${vidDomId}', ${p2Sec + 2})">Phần 2: Song ngữ (${r.chapters.part2})</button>
-            <button class="chip" onclick="seekVideo('${vidDomId}', ${p3Sec + 2})">Phần 3: Nghe ngấm (${r.chapters.part3})</button>
-          </div>
-        </div>
-      </div>
-
-      <textarea id="${descDomId}" style="display:none;" readonly>${j.description_text || ''}</textarea>
-
-      <div class="card-actions">
-        <div class="card-actions-left">
-          <button class="btn btn-primary-soft" onclick="openFolder('${j.id}')">📂 Mở thư mục lấy Video</button>
-          <button class="btn" onclick="copyText('${descDomId}')">📋 Copy Mô tả YouTube</button>
-          <a class="btn" href="/outputs/${encId}/${r.video_file}?v=${j.sort_ts || 1}" download="${j.level}_${j.topic}_16x9.mp4">⬇️ Tải 16:9</a>
-          ${vVertUrl ? `<a class="btn" href="${vVertUrl}?v=${j.sort_ts || 1}" download="${j.level}_${j.topic}_9x16.mp4">⬇️ Tải 9:16</a>` : ''}
-        </div>
-        <button class="btn btn-danger-soft" onclick="deleteJob('${j.id}')" title="Xoá video này">🗑️ Xoá</button>
-      </div>
-    `;
-  }
-
-  return `
-    <div class="job-top">
-      <div class="job-title-wrap">
-        <span class="lvl-badge">${j.level}</span>
-        <span class="job-title">${j.topic}</span>
-      </div>
-      <span class="status-pill ${stClass}">${stText}</span>
-    </div>
-    ${bodyHtml}
-  `;
-}
-
-async function refreshJobs() {
-  try {
-    const res = await fetch('/api/jobs');
-    const jobs = await res.json();
-    const container = document.getElementById('jobsContainer');
-    const countBadge = document.getElementById('jobCountBadge');
-    if (countBadge) countBadge.textContent = jobs.length ? `${jobs.length} video` : '';
-
-    if (!jobs.length) {
-      container.innerHTML = `<p id="emptyMsg" style="color:var(--muted);font-size:13.5px;padding:16px 0;">Chưa có video nào. Hãy nhập chủ đề bên trái và bấm <b>"Tạo Video Ngay"</b>!</p>`;
-      return;
-    }
-    const emptyEl = document.getElementById('emptyMsg');
-    if (emptyEl) emptyEl.remove();
-
-    jobs.forEach((j, idx) => {
-      const stateKey = `${j.status}|${j.progress}|${j.message}|${j.sort_ts || 0}`;
-      let card = document.getElementById(`card_${j.id}`);
-      if (!card) {
-        card = document.createElement('div');
-        card.id = `card_${j.id}`;
-        card.className = 'job-card';
-        card.innerHTML = renderJobCardInner(j);
-        if (idx === 0 && container.firstChild) {
-          container.insertBefore(card, container.firstChild);
-        } else {
-          container.appendChild(card);
-        }
-        cardStates[j.id] = stateKey;
-      } else if (cardStates[j.id] !== stateKey) {
-        card.innerHTML = renderJobCardInner(j);
-        cardStates[j.id] = stateKey;
-      }
-    });
-  } catch (e) {
-    console.error(e);
-  }
-}
-
-setInterval(refreshJobs, 1500);
-refreshJobs();
-</script>
-</body>
-</html>
-"""
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    return INDEX_HTML
+    # Read per request so UI edits show up on refresh without restarting the server
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     import uvicorn
 
     port = int(os.environ.get("PORT", "8095"))

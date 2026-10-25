@@ -14,16 +14,73 @@ Hệ thống tự động sản xuất **Video Luyện Nghe Tiếng Anh 3 Phần
 - **Xuất bản đa nền tảng:**
   - Video 3 Phần chuẩn YouTube (`16:9`), Shorts/Reels (`9:16`), TikTok Highlight, ảnh bìa Thumbnail và file Mô tả YouTube kèm Chapters tự động.
 
-## 🚀 Cách chạy nhanh (Windows)
+## 🚀 Cài đặt & chạy nhanh
+
+Yêu cầu: **Python 3.10+** (đã thử trên 3.14). FFmpeg được cài tự động qua `imageio-ffmpeg`.
+
+### 1. Cấu hình API key Gemini
 
 ```bash
-# 1. Tạo môi trường ảo & cài đặt thư viện
-python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt
-
-# 2. Chạy bản Desktop App
-Chay_Ung_Dung_Desktop.bat
-
-# Hoặc chạy bản Web Server (cổng 8095)
-run_factory.bat
+cp .env.example .env      # Windows: copy .env.example .env
+# mở .env và điền GEMINI_API_KEY=...
 ```
+
+Có thể bỏ qua bước này và nhập key trực tiếp trong giao diện (key được lưu vào `.env`, file này đã nằm trong `.gitignore`). Biến môi trường `GEMINI_API_KEY` cũng được hỗ trợ.
+
+### 2. Chạy ứng dụng
+
+| | macOS | Windows |
+|---|---|---|
+| **Desktop App** | `./Chay_Ung_Dung_Desktop.command` | `Chay_Ung_Dung_Desktop.bat` |
+| **Web Studio** (cổng 8095) | `./run_factory.command` | `run_factory.bat` |
+
+Lần chạy đầu tiên, script tự tạo `.venv` và cài thư viện. Làm thủ công:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt     # Windows: .venv\Scripts\pip
+.venv/bin/python app.py                       # Web Studio tại http://127.0.0.1:8095
+.venv/bin/python desktop_app.py               # Desktop App (tự khởi động backend)
+```
+
+> macOS: nếu bị chặn khi mở file `.command`, chạy `chmod +x *.command` một lần.
+
+## 🗂️ Cấu trúc dự án
+
+```
+app.py             FastAPI backend + API (jobs, batch, storage, system-stats)
+static/index.html  Giao diện Web Studio
+desktop_app.py     Giao diện Desktop (Tkinter), gọi backend qua HTTP
+screenwriter.py    Biên kịch 5 bước + tìm chủ đề Hot
+generator.py       Facade tương thích, re-export từ package studio
+studio/
+  common.py        Hằng số, API key, safe_err (che key trong log)
+  script.py        Parse/sinh kịch bản, kịch bản dự phòng
+  emotion.py       18 cảm xúc, cường độ, prosody
+  tts.py           Giọng đọc Gemini Live / REST, xử lý PCM
+  render.py        Slide, teleprompter, video cuộn, ring âm thanh
+  thumbnail.py     Thumbnail 2D Webtoon + sinh ảnh nền
+  video.py         build_video_job: ghép toàn bộ pipeline
+  storage.py       Dọn dẹp thư mục outputs/
+tests/             pytest
+```
+
+## 🧪 Kiểm thử
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+## 🧹 Dọn dẹp video cũ
+
+Thư mục `outputs/` tăng nhanh (vài trăm MB mỗi video). Dùng nút **🧹 Dọn dẹp** trong giao diện (giữ 10 video mới nhất, không bao giờ xoá job đang chạy), hoặc dòng lệnh:
+
+```bash
+.venv/bin/python clean_outputs.py --keep 10 --dry-run   # xem trước
+.venv/bin/python clean_outputs.py --keep 10
+```
+
+## 🪵 Log
+
+Backend khi được Desktop App khởi động ghi log vào `outputs/backend.log`. Key API luôn được che (`key=***`) trong log.
